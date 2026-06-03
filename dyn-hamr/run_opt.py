@@ -110,6 +110,7 @@ def run_opt(cfg, dataset, out_dir, device):
     cfg = resolve_cfg_paths(cfg)
     paths = cfg.paths
     Logger.log(f"Loading hand model")
+    
     # Instantiate MANO model
     mano_cfg = {k.lower(): v for k,v in dict(cfg.MANO).items()}
     print('initializing MANO model with cfgs:', mano_cfg)
@@ -186,8 +187,11 @@ def main(cfg: DictConfig):
     cfg.data.sources = expand_source_paths(cfg.data.sources)
     print("SOURCES", cfg.data.sources)
 
+    # load dataset
     dataset = get_dataset_from_cfg(cfg)
     save_track_info(dataset, out_dir)
+    
+    # set visible gpu devices
     os.environ["CUDA_VISIBLE_DEVICES"] = str(cfg.get("gpu"))
     print("CUDA_VISIBLE_DEVICES", os.environ["CUDA_VISIBLE_DEVICES"])
     device_id = cfg.get("gpu")

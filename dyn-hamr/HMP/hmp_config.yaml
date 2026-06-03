@@ -71,6 +71,10 @@ output_trans: false
 overlap_len: 16
 pretrained_gmp: false
 save_dir: _DATA/hmp_model
+temporal_filter:
+  type: none
+  min_cutoff: 0.004
+  beta: 0.7
 
 scheduler:
   gamma: 0.7

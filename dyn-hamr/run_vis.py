@@ -1,5 +1,7 @@
 import os
 import glob
+import json
+import sys
 
 import imageio
 import numpy as np
@@ -23,6 +25,35 @@ from vis.viewer import init_viewer
 import time
 from geometry.mesh import save_mesh_scenes, vertices_to_trimesh
 LIGHT_BLUE=(0.65098039,  0.74117647,  0.85882353)
+
+def apply_render_bundle_paths(log_dir, cfg):
+    manifest_path = os.path.join(log_dir, "render_bundle.json")
+    if not os.path.isfile(manifest_path):
+        return cfg
+
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+
+    def bundle_path(name):
+        return os.path.abspath(os.path.join(log_dir, manifest["data"][name]))
+
+    cfg.data.root = os.path.abspath(os.path.join(log_dir, "data"))
+    cfg.data.seq = manifest["sequence"]
+    cfg.data.shot_idx = int(manifest["shot_idx"])
+    cfg.data.start_idx = 0
+    cfg.data.end_idx = int(manifest["frame_count"])
+    cfg.data.track_ids = "all"
+    cfg.data.split_cameras = True
+    cfg.data.sources.images = bundle_path("images")
+    cfg.data.sources.tracks = bundle_path("tracks")
+    cfg.data.sources.shots = bundle_path("shots")
+    cfg.data.sources.cameras = bundle_path("cameras")
+    cfg.data.src_path = os.path.join(cfg.data.root, "videos", f"{cfg.data.seq}.{cfg.data.ext}")
+    if "use_vipe" in cfg.data:
+        cfg.data.use_vipe = False
+    print(f"USING RENDER BUNDLE {manifest_path}")
+    return cfg
+
 
 def save_meshes_all(cfg, dataset, res_dicts, dev_id, mesh_dirs, num_steps=-1):
     B = len(dataset)
@@ -379,6 +410,7 @@ def render_results(cfg, dataset, dev_id, res_dicts, out_names, **kwargs):
 def visualize_log(log_dir, dev_id, phases, save_dir=None, **kwargs):
     print(log_dir)
     cfg = load_config_from_log(log_dir)
+    cfg = apply_render_bundle_paths(log_dir, cfg)
     print(cfg)
     print(cfg.data)
     print(cfg.data.sources)
@@ -398,8 +430,13 @@ def visualize_log(log_dir, dev_id, phases, save_dir=None, **kwargs):
 def launch_vis(i, args):
     log_dir = args.log_dirs[i]
     dev_id = args.gpus[i % len(args.gpus)]
-    os.environ["EGL_DEVICE_ID"] = str(dev_id)
-    os.environ["PYOPENGL_PLATFORM"] = "egl"
+    save_dir = None
+    if sys.platform.startswith("linux"):
+        os.environ["EGL_DEVICE_ID"] = str(dev_id)
+        os.environ["PYOPENGL_PLATFORM"] = "egl"
+    else:
+        os.environ.pop("EGL_DEVICE_ID", None)
+        os.environ.pop("PYOPENGL_PLATFORM", None)
 
     if args.save_root is not None:
         path_name = log_dir.split(args.log_root)[-1].strip("/")

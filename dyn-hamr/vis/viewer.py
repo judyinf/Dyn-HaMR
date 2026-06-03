@@ -1,4 +1,5 @@
 import os
+import sys
 import imageio
 import numpy as np
 
@@ -6,7 +7,10 @@ import time
 import torch
 import trimesh
 
-os.environ["PYOPENGL_PLATFORM"] = "egl"
+if sys.platform.startswith("linux"):
+    os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+else:
+    os.environ.pop("PYOPENGL_PLATFORM", None)
 
 import pyrender
 from pyrender.constants import RenderFlags
@@ -27,15 +31,6 @@ def init_viewer(
 ):
     img_size = int(vis_scale * img_size[0]), int(vis_scale * img_size[1])
     intrins = vis_scale * intrins
-
-    platform = os.environ.get("PYOPENGL_PLATFORM", "pyglet")
-    if platform == "pyglet":
-        vis = AnimationViewer(img_size, intrins=intrins, fps=fps)
-        print("VIS", vis)
-        return vis
-
-    if platform != "egl":
-        raise NotImplementedError
 
     vis = OffscreenAnimation(img_size, intrins=intrins, fps=fps)
     if bg_paths is not None:

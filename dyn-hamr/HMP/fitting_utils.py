@@ -12,7 +12,8 @@ from smplx import MANO
 from loguru import logger 
 import matplotlib.pyplot as plt
 from PIL import Image, ImageDraw
-from rotations import axis_angle_to_matrix, matrix_to_axis_angle
+from rotations import (axis_angle_to_matrix, axis_angle_to_quaternion,
+                       matrix_to_axis_angle, quaternion_to_axis_angle)
 import torch.nn.functional as torch_f
 from nemf.losses import pos_smooth_loss
 
@@ -119,15 +120,161 @@ def compute_seq_intervals(seq_len, split_len=128, overlap_len=16):
     # for seq_len = 320 [0, 128], [112, 240], [224, 320]
     # for seq_len = 565 [0, 128], [112, 240], [224, 352], [336, 464], [448, 565]
     
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if split_len <= 0:
+        raise ValueError(f"split_len must be positive, got {split_len}")
+    if overlap_len < 0 or overlap_len >= split_len:
+        raise ValueError(
+            f"overlap_len must satisfy 0 <= overlap_len < split_len, "
+            f"got overlap_len={overlap_len}, split_len={split_len}"
+        )
+
     intervals = []
     for i in range(0, seq_len, split_len - overlap_len):
         start = i
         end = min(i + split_len, seq_len)
         
         intervals.append((start, end))
-        if (end - start) < split_len:
+        if end == seq_len:
             break
     return intervals
+
+
+def get_window_blend_weights(intervals, window_idx):
+    """Build cosine overlap-add weights for one unpadded interval."""
+    start, end = intervals[window_idx]
+    weights = np.ones(end - start, dtype=np.float32)
+
+    if window_idx > 0:
+        prev_end = intervals[window_idx - 1][1]
+        overlap = max(0, prev_end - start)
+        if overlap:
+            x = np.arange(1, overlap + 1, dtype=np.float32) / (overlap + 1)
+            weights[:overlap] *= np.sin(0.5 * np.pi * x) ** 2
+
+    if window_idx + 1 < len(intervals):
+        next_start = intervals[window_idx + 1][0]
+        overlap = max(0, end - next_start)
+        if overlap:
+            x = np.arange(1, overlap + 1, dtype=np.float32) / (overlap + 1)
+            weights[-overlap:] *= np.cos(0.5 * np.pi * x) ** 2
+
+    return weights
+
+
+def blend_window_values(window_values, intervals, seq_len):
+    """Blend Euclidean window values back into a full-length sequence."""
+    _validate_window_values(window_values, intervals)
+    output = np.zeros((seq_len,) + window_values[0].shape[1:], dtype=np.float32)
+    weight_sum = np.zeros(seq_len, dtype=np.float32)
+    for window_idx, (values, (start, end)) in enumerate(zip(window_values, intervals)):
+        weights = get_window_blend_weights(intervals, window_idx)
+        weight_shape = (len(weights),) + (1,) * (values.ndim - 1)
+        output[start:end] += values * weights.reshape(weight_shape)
+        weight_sum[start:end] += weights
+
+    if np.any(weight_sum == 0):
+        raise ValueError("Sliding windows do not cover the full sequence")
+    weight_shape = (seq_len,) + (1,) * (output.ndim - 1)
+    return output / weight_sum.reshape(weight_shape)
+
+
+def blend_window_axis_angles(window_values, intervals, seq_len):
+    """Blend axis-angle windows by averaging sign-aligned quaternions."""
+    _validate_window_values(window_values, intervals)
+    quat_sum = None
+    reference = None
+    weight_sum = np.zeros(seq_len, dtype=np.float32)
+
+    for window_idx, (values, (start, end)) in enumerate(zip(window_values, intervals)):
+        quaternions = axis_angle_to_quaternion(torch.as_tensor(values)).numpy()
+        if quat_sum is None:
+            quat_sum = np.zeros((seq_len,) + quaternions.shape[1:], dtype=np.float32)
+            reference = np.zeros_like(quat_sum)
+
+        weights = get_window_blend_weights(intervals, window_idx)
+        for local_idx, global_idx in enumerate(range(start, end)):
+            quat = quaternions[local_idx]
+            if weight_sum[global_idx] == 0:
+                reference[global_idx] = quat
+            dot = np.sum(quat * reference[global_idx], axis=-1, keepdims=True)
+            quat = np.where(dot < 0, -quat, quat)
+            quat_sum[global_idx] += weights[local_idx] * quat
+            weight_sum[global_idx] += weights[local_idx]
+
+    if quat_sum is None or np.any(weight_sum == 0):
+        raise ValueError("Sliding windows do not cover the full sequence")
+    norms = np.linalg.norm(quat_sum, axis=-1, keepdims=True)
+    quaternions = quat_sum / np.maximum(norms, 1e-8)
+    return quaternion_to_axis_angle(torch.from_numpy(quaternions)).numpy()
+
+
+def _validate_window_values(window_values, intervals):
+    if not window_values or len(window_values) != len(intervals):
+        raise ValueError(
+            f"Expected one result per interval, got {len(window_values)} results "
+            f"for {len(intervals)} intervals"
+        )
+    for values, (start, end) in zip(window_values, intervals):
+        if len(values) != end - start:
+            raise ValueError(
+                f"Window [{start}, {end}) expects {end - start} values, got {len(values)}"
+            )
+
+
+class OneEuroFilter:
+    """Small NumPy OneEuro filter used for optional prior post-processing."""
+
+    def __init__(self, min_cutoff=0.004, beta=0.7, d_cutoff=1.0, freq=30.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.freq = freq
+        self.prev_value = None
+        self.prev_derivative = None
+
+    def _alpha(self, cutoff):
+        tau = 1.0 / (2.0 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau * self.freq)
+
+    def process(self, value):
+        value = np.asarray(value, dtype=np.float32)
+        if self.prev_value is None:
+            self.prev_value = value
+            self.prev_derivative = np.zeros_like(value)
+            return value
+
+        derivative = (value - self.prev_value) * self.freq
+        d_alpha = self._alpha(self.d_cutoff)
+        derivative = d_alpha * derivative + (1.0 - d_alpha) * self.prev_derivative
+        alpha = self._alpha(self.min_cutoff + self.beta * np.abs(derivative))
+        value = alpha * value + (1.0 - alpha) * self.prev_value
+        self.prev_value = value
+        self.prev_derivative = derivative
+        return value
+
+
+def one_euro_filter_values(values, min_cutoff=0.004, beta=0.7, freq=30.0):
+    filt = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, freq=freq)
+    return np.stack([filt.process(value) for value in values])
+
+
+def one_euro_filter_axis_angles(values, min_cutoff=0.004, beta=0.7, freq=30.0):
+    """Filter rotations as normalized, sign-aligned quaternions."""
+    quaternions = axis_angle_to_quaternion(torch.as_tensor(values)).numpy()
+    filt = OneEuroFilter(min_cutoff=min_cutoff, beta=beta, freq=freq)
+    filtered = []
+    previous = None
+    for quat in quaternions:
+        if previous is not None:
+            dot = np.sum(quat * previous, axis=-1, keepdims=True)
+            quat = np.where(dot < 0, -quat, quat)
+        quat = filt.process(quat)
+        quat /= np.maximum(np.linalg.norm(quat, axis=-1, keepdims=True), 1e-8)
+        filtered.append(quat)
+        previous = quat
+    return quaternion_to_axis_angle(torch.from_numpy(np.stack(filtered))).numpy()
 
 # optimize on pymafx. Optimize translation only. 
 def optimize_on_pymafx(pymafx_dict, pymafx_keypoints2d_path):

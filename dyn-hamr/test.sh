@@ -2,7 +2,7 @@
 
 # Point BASE_PATH directly to subject1
 BASE_PATH="/data/home/zy3023/code/hand/slam-hand/test/HOT3D"
-VIDEO_JSON="/data/home/zy3023/code/hand/slam-hand/slahmr-eccv/confs/data/video.yaml"
+VIDEO_JSON="/data/home/zy3023/code/hand/slam-hand/slahmr-eccv/confs/data/video_driod.yaml"
 
 # Directory for log files
 LOG_DIR="logs"
@@ -36,7 +36,7 @@ for mp4file in "$BASE_PATH"/*.mp4; do
 
     # Run Python in the background (&).
     # Output goes to "$logfile"
-    python -u run_opt.py data=video run_opt=True run_vis=True data.seq=$vidname \
+    python -u run_opt.py data=video_driod run_opt=True run_vis=True data.seq=$vidname \
         > "$logfile" 2>&1 &
 
     ((count++))

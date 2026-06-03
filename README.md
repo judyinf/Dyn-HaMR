@@ -182,13 +182,13 @@ Please follow the instructions [here](https://github.com/MengHao666/Hand-BMC-pyt
 | Config | Operation |
 |--------|-----------------|
 | GPU | Edit in [`<CONFIG_GPU>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/config.yaml#L56) |
-| Video info | Edit in [`<VIDEO_SEQ>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/data/video.yaml#L5) |
-| Interval | Edit in [`<VIDEO_START_END>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/data/video.yaml#L16-L17) |
+| Video info | Edit in [`<VIDEO_SEQ>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/data/video_vipe.yaml#L5) |
+| Interval | Edit in [`<VIDEO_START_END>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/data/video_vipe.yaml#L16-L17) |
 | Optimization configurations | Edit in [`<OPT_WEIGHTS>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/optim.yaml#L29-L49) |
 | General configurations | Edit in [`<GENERAL_CONFIG>`](https://github.com/ZhengdiYu/Dyn-HaMR/blob/main/dyn-hamr/confs/config.yaml) |
 
 ### Fitting on RGB-(D) videos 🎮
-To run the optimization pipeline for fitting on arbitrary RGB-(D) videos, please first edit the path information here in `dyn-hamr/confs/data/video.yaml`, where `root` is the root folder to all of your datasets. `video_dir` is the corresponding folder that contains the videos. The key `seq` represents the video name you wanted to process. For example, you can run the following command to recover the global motion for `test/videos/demo1.mp4`:
+To run the optimization pipeline for fitting on arbitrary RGB-(D) videos, please first edit the path information in `dyn-hamr/confs/data/video_vipe.yaml` or `dyn-hamr/confs/data/video_driod.yaml`, where `root` is the root folder to all of your datasets. `video_dir` is the corresponding folder that contains the videos. The key `seq` represents the video name you wanted to process. For example, you can run the following command to recover the global motion for `test/videos/demo1.mp4`:
 
 
 #### 🌟 Using VIPE for Camera Estimation (Recommended)
@@ -200,7 +200,7 @@ python run_opt.py data=video_vipe run_opt=True data.seq=demo1 is_static=False
 
 #### 🌟 Using original DROID-SLAM for Camera Estimation
 ```bash
-python run_opt.py data=video run_opt=True data.seq=demo1 is_static=<True or False>
+python run_opt.py data=video_driod run_opt=True data.seq=demo1 is_static=<True or False>
 ```
 
 VIPE will automatically run if results are not found. Make sure you have:
@@ -215,6 +215,26 @@ This will visualize all log subdirectories and save the rendered videos and imag
 ```
 python -u run_opt.py data=video_vipe run_opt=True run_vis=True is_static=<True of False>
 ```
+
+To render on a different machine, export a portable bundle after optimization:
+```bash
+python tools/export_render_bundle.py \
+  --log-dir /path/to/demo1-all-shot-0-0-128 \
+  --output /path/to/demo1-render-bundle \
+  --phases init root_fit smooth_fit prior
+```
+The bundle contains the final result from each available phase, the selected input frames, tracks, cameras, and prior diagnostics. It does not copy the MANO model. Move the bundle to a machine with the project environment and MANO assets, then render it with:
+```bash
+python run_vis.py \
+  --log_root /path/to/demo1-render-bundle \
+  --save_root /path/to/rendered \
+  --phases init root_fit smooth_fit prior \
+  --gpus 0 \
+  -rv src_cam front above side \
+  -g
+```
+On macOS, `run_vis.py` automatically uses the local OpenGL context instead of Linux EGL. PyTorch rendering preparation falls back to CPU when CUDA is unavailable.
+
 As a multi-stage pipeline, you can customize the optimization process. Add `is_static=True` for static camera videos. Adding `run_prior=True` can activate the motion prior in stage III. Please note that in the current version, each motion chunk size needs to be set to 128 to be compatible with the original setting of HMP only when the prior module is activated.
 
 ### Blender Addon
