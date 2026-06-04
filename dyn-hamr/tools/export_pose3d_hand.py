@@ -19,6 +19,42 @@ from HMP.rotations import axis_angle_to_matrix, matrix_to_axis_angle, matrix_to_
 from optim.output import load_track_info
 
 
+class Timeline:
+    def __init__(
+        self,
+        data_interval: tuple[int, int],
+        seq_interval: tuple[int, int],
+    ) -> None:
+        data_start, data_end = data_interval
+        seq_start, seq_end = seq_interval
+        if data_end <= data_start:
+            raise ValueError(f"Invalid data_interval {data_interval}")
+        if seq_start < data_start or seq_end > data_end or seq_end <= seq_start:
+            raise ValueError(
+                f"Invalid seq_interval {seq_interval} for data_interval {data_interval}"
+            )
+        self.data_start = data_start
+        self.data_end = data_end
+        self.seq_start = seq_start
+        self.seq_end = seq_end
+
+    @property
+    def full_len(self) -> int:
+        return self.data_end - self.data_start
+
+    @property
+    def seq_len(self) -> int:
+        return self.seq_end - self.seq_start
+
+    @property
+    def insert_start(self) -> int:
+        return self.seq_start - self.data_start
+
+    @property
+    def insert_end(self) -> int:
+        return self.seq_end - self.data_start
+
+
 def result_sort_key(path: Path):
     parts = path.name.split("_")
     if len(parts) < 3 or parts[-2] not in {"world", "prior"}:
@@ -54,7 +90,18 @@ def _as_float_scalar(value: np.ndarray | float | int) -> float:
 
 
 def _pred_valid_from_vis_mask(vis_mask: np.ndarray, seq_len: int) -> np.ndarray:
-    mask = np.asarray(vis_mask, dtype=np.float32).reshape(-1)
+    raw = np.asarray(vis_mask).reshape(-1)
+    if raw.dtype == np.bool_:
+        mask = raw.astype(bool)
+        if mask.shape[0] > seq_len:
+            mask = mask[:seq_len]
+        elif mask.shape[0] < seq_len:
+            padded = np.zeros(seq_len, dtype=bool)
+            padded[: mask.shape[0]] = mask
+            mask = padded
+        return mask
+
+    mask = raw.astype(np.float32)
     seq_start, seq_end = 0, seq_len
     if mask.shape[0] > seq_len:
         # track_info vis_mask covers the optimized subsequence interval
@@ -64,6 +111,21 @@ def _pred_valid_from_vis_mask(vis_mask: np.ndarray, seq_len: int) -> np.ndarray:
         padded[: mask.shape[0]] = mask
         mask = padded
     return (mask >= 0).astype(bool)
+
+
+def _vis_mask_for_timeline(vis_mask: np.ndarray, timeline: Timeline) -> np.ndarray:
+    mask = np.asarray(vis_mask).reshape(-1)
+    is_bool = mask.dtype == np.bool_
+    if mask.shape[0] >= timeline.data_end:
+        mask = mask[timeline.data_start : timeline.data_end]
+    elif mask.shape[0] > timeline.full_len:
+        mask = mask[: timeline.full_len]
+    elif mask.shape[0] < timeline.full_len:
+        fill_value = False if is_bool else -1
+        padded = np.full(timeline.full_len, fill_value, dtype=mask.dtype)
+        padded[: mask.shape[0]] = mask
+        mask = padded
+    return mask
 
 
 def _betas_per_frame(betas: np.ndarray, seq_len: int) -> np.ndarray:
@@ -160,6 +222,17 @@ def build_hand_slot(
     }
 
 
+def _insert_hand_slot(full_hand: dict, slot: dict, timeline: Timeline) -> dict:
+    start, end = timeline.insert_start, timeline.insert_end
+    for key, value in slot["mano_params"].items():
+        full_hand["mano_params"][key][start:end] = value
+    for key, value in slot["relative_motion"].items():
+        full_hand["relative_motion"][key][start:end] = value
+    full_hand["pred_valid"][start:end] = slot["pred_valid"]
+    full_hand["detection_failed"] = ~full_hand["pred_valid"]
+    return full_hand
+
+
 def _intrinsics_from_npz(data: dict[str, np.ndarray], batch_idx: int = 0) -> tuple[float, np.ndarray]:
     intrins = data["intrins"]
     if intrins.ndim >= 2:
@@ -194,13 +267,49 @@ def _camera_track_array(
         ) from exc
 
 
-def _camera_traj(data: dict[str, np.ndarray], batch_idx: int, seq_len: int) -> np.ndarray:
-    cam_t = torch.from_numpy(_camera_track_array(data["cam_t"], batch_idx, seq_len, (3,)))
-    cam_R = torch.from_numpy(_camera_track_array(data["cam_R"], batch_idx, seq_len, (3, 3)))
+def _camera_traj_from_arrays(cam_t_arr: np.ndarray, cam_R_arr: np.ndarray) -> np.ndarray:
+    cam_t = torch.from_numpy(np.asarray(cam_t_arr, dtype=np.float32).reshape(-1, 3))
+    cam_R = torch.from_numpy(np.asarray(cam_R_arr, dtype=np.float32).reshape(-1, 3, 3))
     quat_wxyz = matrix_to_quaternion(cam_R)
     quat_xyzw = torch.cat([quat_wxyz[..., 1:], quat_wxyz[..., :1]], dim=-1)
     traj = torch.cat([cam_t, quat_xyzw], dim=-1).to(dtype=torch.float32)
     return traj.numpy()
+
+
+def _camera_traj(data: dict[str, np.ndarray], batch_idx: int, seq_len: int) -> np.ndarray:
+    cam_t = _camera_track_array(data["cam_t"], batch_idx, seq_len, (3,))
+    cam_R = _camera_track_array(data["cam_R"], batch_idx, seq_len, (3, 3))
+    return _camera_traj_from_arrays(cam_t, cam_R)
+
+
+def _camera_traj_for_timeline(
+    data: dict[str, np.ndarray],
+    batch_idx: int,
+    timeline: Timeline,
+) -> np.ndarray:
+    cam_t_arr = np.asarray(data["cam_t"], dtype=np.float32)
+    cam_R_arr = np.asarray(data["cam_R"], dtype=np.float32)
+    full_shape_t = (timeline.full_len, 3)
+    full_shape_r = (timeline.full_len, 3, 3)
+    if cam_t_arr.shape == full_shape_t and cam_R_arr.shape == full_shape_r:
+        cam_t = cam_t_arr
+        cam_R = cam_R_arr
+    elif (
+        cam_t_arr.ndim >= 2
+        and cam_R_arr.ndim >= 3
+        and cam_t_arr.shape[-2:] == full_shape_t
+        and cam_R_arr.shape[-3:] == full_shape_r
+    ):
+        cam_t = cam_t_arr.reshape(-1, timeline.full_len, 3)[batch_idx]
+        cam_R = cam_R_arr.reshape(-1, timeline.full_len, 3, 3)[batch_idx]
+    else:
+        cam_t = np.zeros(full_shape_t, dtype=np.float32)
+        cam_R = np.eye(3, dtype=np.float32)[None].repeat(timeline.full_len, axis=0)
+        seq_cam_t = _camera_track_array(data["cam_t"], batch_idx, timeline.seq_len, (3,))
+        seq_cam_R = _camera_track_array(data["cam_R"], batch_idx, timeline.seq_len, (3, 3))
+        cam_t[timeline.insert_start : timeline.insert_end] = seq_cam_t
+        cam_R[timeline.insert_start : timeline.insert_end] = seq_cam_R
+    return _camera_traj_from_arrays(cam_t, cam_R)
 
 
 def _slam_tstamp(seq_len: int, max_keyframes: int) -> np.ndarray:
@@ -255,12 +364,19 @@ def build_pose3d_hand(
     max_slam_keyframes: int,
     max_slam_frames: int,
     slam_overlap_frames: int,
+    timeline: Timeline | None,
 ) -> dict:
     trans = _as_batch_array(data["trans"])
     B, seq_len = trans.shape[0], trans.shape[1]
+    if timeline is not None and timeline.seq_len != seq_len:
+        raise ValueError(
+            f"world_results T={seq_len} does not match seq_interval length "
+            f"{timeline.seq_len} ({timeline.seq_start}, {timeline.seq_end})"
+        )
+    out_len = timeline.full_len if timeline is not None else seq_len
 
-    left_hand = _empty_hand(seq_len)
-    right_hand = _empty_hand(seq_len)
+    left_hand = _empty_hand(out_len)
+    right_hand = _empty_hand(out_len)
 
     by_side: dict[str, list[int]] = {"left": [], "right": []}
     for b in range(B):
@@ -296,6 +412,10 @@ def build_pose3d_hand(
             vis = track_vis_masks.get(tid)
             if vis is None:
                 raise KeyError(f"track_info has no vis_mask for track id {tid}")
+            if timeline is not None:
+                vis = _vis_mask_for_timeline(vis, timeline)[
+                    timeline.insert_start : timeline.insert_end
+                ]
             pred_valid = _pred_valid_from_vis_mask(vis, seq_len)
         else:
             pred_valid = np.ones(seq_len, dtype=bool)
@@ -307,6 +427,8 @@ def build_pose3d_hand(
             _as_batch_array(data["betas"])[b],
             pred_valid,
         )
+        if timeline is not None:
+            slot = _insert_hand_slot(_empty_hand(out_len), slot, timeline)
         if is_right:
             right_hand = slot
         else:
@@ -316,13 +438,18 @@ def build_pose3d_hand(
     focal, center = _intrinsics_from_npz(data, traj_batch)
     fps_value = _optional_scalar(data, ("fps",), fps, traj_batch)
     scale_value = _optional_scalar(data, ("scale", "world_scale"), 1.0, traj_batch)
+    traj = (
+        _camera_traj_for_timeline(data, traj_batch, timeline)
+        if timeline is not None
+        else _camera_traj(data, traj_batch, seq_len)
+    )
     slam_data = {
-        "tstamp": _slam_tstamp(seq_len, max_slam_keyframes),
-        "traj": _camera_traj(data, traj_batch, seq_len),
+        "tstamp": _slam_tstamp(out_len, max_slam_keyframes),
+        "traj": traj,
         "img_focal": np.array(focal, dtype=np.float64),
         "img_center": center.astype(np.float64),
         "scale": np.array(scale_value, dtype=np.float64),
-        "slam_n_chunks": _slam_n_chunks(seq_len, max_slam_frames, slam_overlap_frames),
+        "slam_n_chunks": _slam_n_chunks(out_len, max_slam_frames, slam_overlap_frames),
         "max_slam_frames": int(max_slam_frames),
         "slam_overlap_frames": int(slam_overlap_frames),
     }
@@ -367,17 +494,17 @@ def export_pose3d_hand(
 
     track_vis_masks = None
     track_ids_list = None
+    timeline = None
     track_info_path = log_dir / "track_info.json"
     if track_info_path.is_file():
-        tids, vis_masks, _, seq_interval = load_track_info(str(track_info_path))
+        tids, vis_masks, data_interval, seq_interval = load_track_info(str(track_info_path))
+        data_start, data_end = map(int, data_interval)
         seq_start, seq_end = map(int, seq_interval)
+        timeline = Timeline((data_start, data_end), (seq_start, seq_end))
         track_ids_list = [int(t) for t in tids.tolist()]
         track_vis_masks = {}
         for tid, mask in zip(track_ids_list, vis_masks.tolist()):
-            m = np.asarray(mask, dtype=np.float32)
-            if m.shape[0] >= seq_end:
-                m = m[seq_start:seq_end]
-            track_vis_masks[tid] = m
+            track_vis_masks[tid] = np.asarray(mask)
 
     payload = build_pose3d_hand(
         data,
@@ -388,6 +515,7 @@ def export_pose3d_hand(
         max_slam_keyframes=max_slam_keyframes,
         max_slam_frames=max_slam_frames,
         slam_overlap_frames=slam_overlap_frames,
+        timeline=timeline,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
