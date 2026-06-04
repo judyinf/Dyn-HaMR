@@ -1,7 +1,8 @@
 type: video
 split: custom
-root: /data/home/zy3023/code/hand/Dyn-HaMR/test  # put your videos in root/videos/vid.mp4
-video_dir: videos
+# root: /data/home/zy3023/code/hand/Dyn-HaMR/test  # put your videos in root/videos/vid.mp4
+root: /home/yinghua/Dyn-HaMR/test
+video_dir: videos/segment_000_ch1_undistort
 seq: prod1
 ext: mp4
 src_path: ${data.root}/${data.video_dir}/${data.seq}.${data.ext}
@@ -25,5 +26,7 @@ sources:
 
 # VIPE-specific options
 use_vipe: True
-vipe_dir: /data/home/zy3023/code/hand/Dyn-HaMR/third-party/vipe/vipe_results
+# vipe_dir: /data/home/zy3023/code/hand/Dyn-HaMR/third-party/vipe/vipe_results
+vipe_dir: /home/yinghua/Dyn-HaMR/third-party/vipe/vipe_results
+
 

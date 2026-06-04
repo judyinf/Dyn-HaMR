@@ -50,8 +50,8 @@ sys.path.append('HMP/')
 # print(torch.cuda.memory_summary())
 from HMP.fitting import run_prior
 
-from human_body_prior.tools.model_loader import load_model
-from human_body_prior.models.vposer_model import VPoser
+# from human_body_prior.tools.model_loader import load_model
+# from human_body_prior.models.vposer_model import VPoser
 
 def set_seed(seed=42):
     """
