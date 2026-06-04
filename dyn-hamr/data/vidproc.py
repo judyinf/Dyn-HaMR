@@ -1,4 +1,6 @@
 import os
+import shlex
+import shutil
 import numpy as np
 import subprocess
 import cv2
@@ -167,16 +169,18 @@ def run_vipe(video_path, vipe_dir, vipe_root):
     print(f"VIPE root: {vipe_root}")
     print(f"Results will be saved to: {vipe_dir}")
     
-    # Build VIPE command with proper conda activation
-    # We need to source conda.sh first to make conda activate work in subprocess
-    conda_sh = os.path.expanduser("~/miniconda3/etc/profile.d/conda.sh")
-    if not os.path.exists(conda_sh):
-        conda_sh = os.path.expanduser("~/anaconda3/etc/profile.d/conda.sh")
-    
-    cmd = f"source {conda_sh} && conda activate vipe && cd {vipe_root} && vipe infer {video_path}"
-    
-    print(f"Executing: {cmd}")
-    out = subprocess.call(cmd, shell=True, executable="/bin/bash")
+    conda_exe = os.environ.get("CONDA_EXE") or shutil.which("conda")
+    if conda_exe is None:
+        raise FileNotFoundError(
+            "Could not find conda. Set CONDA_EXE or add conda to PATH before running VIPE."
+        )
+    if not os.path.isdir(vipe_root):
+        raise FileNotFoundError(f"VIPE root directory not found: {vipe_root}")
+
+    cmd = [conda_exe, "run", "-n", "vipe", "vipe", "infer", video_path]
+
+    print(f"Executing in {vipe_root}: {shlex.join(cmd)}")
+    out = subprocess.call(cmd, cwd=vipe_root)
     
     if out != 0:
         print(f"WARNING: VIPE failed with exit code {out}")
@@ -208,10 +212,15 @@ def preprocess_cameras(cfg, overwrite=False):
             vipe_root = os.path.dirname(vipe_dir)
             video_path = cfg.get("src_path", None)
             
-            if video_path is None or not os.path.exists(video_path):
+            if video_path is None or not os.path.isfile(video_path):
                 raise FileNotFoundError(
-                    f"Video path not found: {video_path}\n"
-                    f"Cannot run VIPE. Please provide a valid 'src_path' in your config."
+                    "VIPE input video not found or is not a file.\n"
+                    f"  data.root: {cfg.get('root', None)}\n"
+                    f"  data.video_dir: {cfg.get('video_dir', None)}\n"
+                    f"  data.seq: {cfg.get('seq', None)}\n"
+                    f"  data.ext: {cfg.get('ext', None)}\n"
+                    f"  resolved data.src_path: {video_path}\n"
+                    "Expected data.src_path to resolve to a single video file."
                 )
             
             # Run VIPE
@@ -220,9 +229,8 @@ def preprocess_cameras(cfg, overwrite=False):
                 raise RuntimeError(
                     f"VIPE failed with exit code {out}\n"
                     f"Please check VIPE installation and try running manually:\n"
-                    f"  conda activate vipe\n"
-                    f"  cd {vipe_root}\n"
-                    f"  vipe infer {video_path}"
+                    f"  cd {shlex.quote(vipe_root)}\n"
+                    f"  conda run -n vipe vipe infer {shlex.quote(video_path)}"
                 )
         
         # Load VIPE results (after potentially running VIPE)

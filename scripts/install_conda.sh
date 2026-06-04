@@ -29,6 +29,8 @@ python setup.py install
 cd ../..
 
 # install HaMeR
-cd third-party/HaMeR
+cd third-party/hamer
 pip install -e .[all]
+
+# install ViTPose
 pip install -v -e third-party/ViTPose

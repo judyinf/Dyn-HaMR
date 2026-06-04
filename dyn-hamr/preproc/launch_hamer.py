@@ -32,7 +32,6 @@ def launch_hamer(gpus, seq, img_dir, res_dir, name, datatype, overwrite=False):
         f"--batch_size=48 --side_view --save_mesh --full_frame",
         f"--type {datatype}",
         f"--checkpoint {ROOT_DIR}",
-        "--render"
     ]
 
     cmd = " ".join(cmd_args)
@@ -62,9 +61,9 @@ def process_seq(
 
     if overwrite or not os.path.isfile(res_path):
         res = launch_hamer(gpus, seq, img_dir, res_dir, name, datatype, overwrite)
+        assert res == 0, "HAMER FAILED"
         print(f'rename {res_dir}/demo_{name}.pkl into ', res_path)
         os.rename(f"{res_dir}/demo_{name}.pkl", res_path)
-        assert res == 0, "HAMER FAILED"
 
     # export the HAMER predictions
     track_dir = f"{out_root}/{track_name}/{seq}"
