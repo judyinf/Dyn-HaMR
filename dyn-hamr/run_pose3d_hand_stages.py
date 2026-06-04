@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
-"""Run Dyn-HaMR optimization stages with .pose3d_hand as the stage interface."""
+"""Run Dyn-HaMR stages with .pose3d_hand and Hydra configuration."""
 
 from __future__ import annotations
 
-import argparse
-import json
-import os
 import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
+import hydra
 import numpy as np
 import torch
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation
 
-_SCRIPT_DIR = Path(__file__).resolve().parent
-_DYN_HAMR_ROOT = _SCRIPT_DIR.parent
+_DYN_HAMR_ROOT = Path(__file__).resolve().parent
+_REPO_ROOT = _DYN_HAMR_ROOT.parent
 if str(_DYN_HAMR_ROOT) not in sys.path:
     sys.path.insert(0, str(_DYN_HAMR_ROOT))
 
@@ -32,11 +29,18 @@ from util.loaders import resolve_cfg_paths
 from util.logger import Logger
 from util.tensor import move_to
 
-from export_pose3d_hand import _compute_relative_motion
-
 
 STAGE_ORDER = ("root", "smooth", "prior")
 STAGE_DIR = {"root": "root_fit", "smooth": "smooth_fit", "prior": "prior"}
+
+
+def resolve_path(value: str | Path | None) -> Path | None:
+    if value is None:
+        return None
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (_DYN_HAMR_ROOT / path).resolve()
 
 
 def _as_numpy(value: Any, dtype: np.dtype | None = None) -> np.ndarray:
@@ -89,6 +93,38 @@ def camera_to_traj(cam_R: np.ndarray, cam_t: np.ndarray, convention: str) -> np.
     return np.concatenate([t.astype(np.float32), quat], axis=-1).astype(np.float32)
 
 
+def _compute_relative_motion(
+    global_orient: torch.Tensor,
+    transl: torch.Tensor,
+    pred_valid: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    T = global_orient.shape[0]
+    rel_trans = torch.zeros(T, 3, dtype=torch.float32)
+    rel_rot_mat = torch.eye(3, dtype=torch.float32).unsqueeze(0).repeat(T, 1, 1)
+    rel_rot_aa = torch.zeros(T, 3, dtype=torch.float32)
+    pair_valid = torch.zeros(T, dtype=torch.bool)
+
+    rot_mats_np = Rotation.from_rotvec(global_orient.detach().cpu().numpy()).as_matrix()
+    rot_mats = torch.from_numpy(rot_mats_np.astype(np.float32))
+    for t in range(1, T):
+        if not (bool(pred_valid[t]) and bool(pred_valid[t - 1])):
+            continue
+        pair_valid[t] = True
+        rel_trans[t] = transl[t] - transl[t - 1]
+        delta = rot_mats[t] @ rot_mats[t - 1].transpose(-1, -2)
+        rel_rot_mat[t] = delta
+        rel_rot_aa[t] = torch.from_numpy(
+            Rotation.from_matrix(delta.numpy()).as_rotvec().astype(np.float32)
+        )
+
+    return {
+        "rel_trans": rel_trans,
+        "rel_rot_mat": rel_rot_mat,
+        "rel_rot_aa": rel_rot_aa,
+        "pair_valid": pair_valid,
+    }
+
+
 def infer_seq_name(path: Path) -> str:
     name = path.name
     if name.endswith(".pose3d_hand"):
@@ -99,26 +135,6 @@ def infer_seq_name(path: Path) -> str:
     return name
 
 
-def read_keypoints(path: Path) -> np.ndarray:
-    empty = np.zeros((OP_NUM_JOINTS, 3), dtype=np.float32)
-    if not path.is_file():
-        return empty
-    with path.open() as f:
-        data = json.load(f)
-    people = data.get("people", [])
-    if not people:
-        return empty
-    keypoints = np.asarray(people[0].get("pose_keypoints_2d", empty), dtype=np.float32)
-    return keypoints.reshape(-1, 3)
-
-
-def write_keypoints(path: Path, keypoints: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"people": [{"pose_keypoints_2d": np.asarray(keypoints).reshape(-1, 3).tolist()}]}
-    with path.open("w") as f:
-        json.dump(payload, f)
-
-
 def interpolate_keypoints(keypoints: np.ndarray, valid: np.ndarray) -> np.ndarray:
     keypoints = np.asarray(keypoints, dtype=np.float32).copy()
     valid = np.asarray(valid, dtype=bool)
@@ -126,12 +142,13 @@ def interpolate_keypoints(keypoints: np.ndarray, valid: np.ndarray) -> np.ndarra
     if valid_idx.size <= 1:
         return keypoints
     times = np.arange(valid_idx[0], valid_idx[-1] + 1)
+    missing = times[~np.isin(times, valid_idx)]
+    if missing.size == 0:
+        return keypoints
     for joint_idx in range(keypoints.shape[1]):
         for coord in (0, 1, 2):
             f = interp1d(valid_idx, keypoints[valid_idx, joint_idx, coord], bounds_error=False)
-            missing = times[~np.isin(times, valid_idx)]
-            if missing.size:
-                keypoints[missing, joint_idx, coord] = f(missing)
+            keypoints[missing, joint_idx, coord] = f(missing)
     return keypoints
 
 
@@ -144,7 +161,7 @@ def run_vitpose_for_box(
 ) -> np.ndarray:
     if config is None or checkpoint is None:
         raise RuntimeError(
-            "Missing --vitpose-config/--vitpose-checkpoint and no cached keypoints found"
+            "Missing vitpose_config/vitpose_checkpoint and keypoints_npy does not exist"
         )
     try:
         from mmpose.apis import inference_topdown, init_model
@@ -174,104 +191,190 @@ def load_track_info_npy(path: Path) -> dict[int, list[dict[str, Any]]]:
     return {int(float(k)): list(v) for k, v in raw.items()}
 
 
-def pick_tracks(track_info: dict[int, list[dict[str, Any]]]) -> list[int]:
-    by_hand: dict[int, tuple[int, int]] = {}
+def group_tracks_by_handedness(track_info: dict[int, list[dict[str, Any]]]) -> dict[int, list[int]]:
+    grouped: dict[int, list[int]] = {0: [], 1: []}
     for tid, entries in track_info.items():
-        valid = [e for e in entries if bool(e.get("det", False))]
-        if not valid:
+        handedness = None
+        for entry in entries:
+            if bool(entry.get("det", False)):
+                handedness = int(round(float(entry.get("det_handedness", tid))))
+                break
+        if handedness in grouped:
+            grouped[handedness].append(tid)
+    return grouped
+
+
+def select_candidates_by_frame(
+    entries_by_track: dict[int, list[dict[str, Any]]],
+    T: int,
+) -> tuple[list[dict[str, Any] | None], np.ndarray, np.ndarray]:
+    selected: list[dict[str, Any] | None] = [None] * T
+    source_track = np.full(T, -1, dtype=np.int64)
+    score = np.zeros(T, dtype=np.float32)
+    prev_center: np.ndarray | None = None
+
+    for frame in range(T):
+        candidates = []
+        for tid, entries in entries_by_track.items():
+            for entry in entries:
+                if int(entry["frame"]) == frame and bool(entry.get("det", False)):
+                    box = np.asarray(entry["det_box"], dtype=np.float32)
+                    candidates.append((tid, entry, box))
+        if not candidates:
             continue
-        handed = int(round(float(valid[0].get("det_handedness", tid))))
-        count = len(valid)
-        old = by_hand.get(handed)
-        if old is None or count > old[1]:
-            by_hand[handed] = (tid, count)
-    return [by_hand[h][0] for h in sorted(by_hand)]
+        candidates.sort(key=lambda item: float(item[2][4]) if item[2].size >= 5 else 0.0, reverse=True)
+        best_tid, best_entry, best_box = candidates[0]
+        if prev_center is not None and len(candidates) > 1:
+            best_score = float(best_box[4]) if best_box.size >= 5 else 0.0
+            close = [
+                item for item in candidates
+                if best_score - (float(item[2][4]) if item[2].size >= 5 else 0.0) < 0.05
+            ]
+            if len(close) > 1:
+                best_tid, best_entry, best_box = min(
+                    close,
+                    key=lambda item: float(
+                        np.linalg.norm(((item[2][:2] + item[2][2:4]) / 2.0) - prev_center)
+                    ),
+                )
+        selected[frame] = best_entry
+        source_track[frame] = best_tid
+        score[frame] = float(best_box[4]) if best_box.size >= 5 else 0.0
+        prev_center = (best_box[:2] + best_box[2:4]) / 2.0
+    return selected, source_track, score
 
 
-def keypoint_path(root: Path, seq_name: str, track_dir_id: int, frame: int) -> Path:
-    return root / seq_name / f"{track_dir_id:03d}" / f"{frame:06d}_keypoints.json"
+def extract_keypoints_from_track_info(
+    track_info: dict[int, list[dict[str, Any]]],
+    T: int,
+    seq_name: str,
+    image_root: Path,
+    vitpose_config: Path,
+    vitpose_checkpoint: Path,
+    device: str,
+) -> dict[str, dict[int, dict[str, Any]]]:
+    grouped = group_tracks_by_handedness(track_info)
+    tracks: dict[int, dict[str, Any]] = {}
+    for handedness, tids in grouped.items():
+        keypoints = np.zeros((T, OP_NUM_JOINTS, 3), dtype=np.float32)
+        valid = np.zeros(T, dtype=bool)
+        entries_by_track = {tid: track_info[tid] for tid in tids}
+        selected, source_track, score = select_candidates_by_frame(entries_by_track, T)
+        for frame, entry in enumerate(selected):
+            if entry is None:
+                continue
+            image_path = image_root / f"{frame:06d}.jpg"
+            if not image_path.is_file():
+                image_path = image_root / f"{frame:06d}.png"
+            keypoints[frame] = run_vitpose_for_box(
+                image_path,
+                np.asarray(entry["det_box"], dtype=np.float32),
+                vitpose_config,
+                vitpose_checkpoint,
+                device,
+            )
+            valid[frame] = not np.all(keypoints[frame] == 0)
+        keypoints = interpolate_keypoints(keypoints, valid)
+        tracks[handedness] = {
+            "is_right": handedness,
+            "source_track_ids": np.asarray(tids, dtype=np.int64),
+            "frames": np.arange(T, dtype=np.int64),
+            "keypoints": keypoints,
+            "valid": valid,
+            "source_track_per_frame": source_track,
+            "score": score,
+        }
+    return {"tracks": tracks}
+
+
+def load_keypoints_npy(path: Path, T: int) -> dict[int, dict[str, Any]]:
+    raw = np.load(path, allow_pickle=True).item()
+    tracks = raw["tracks"] if "tracks" in raw else raw
+    out: dict[int, dict[str, Any]] = {}
+    for key, value in tracks.items():
+        handedness = int(key)
+        kpts = np.asarray(value["keypoints"], dtype=np.float32)
+        if kpts.shape != (T, OP_NUM_JOINTS, 3):
+            raise ValueError(f"keypoints[{key}] shape {kpts.shape} does not match {(T, OP_NUM_JOINTS, 3)}")
+        out[handedness] = {
+            "is_right": int(value.get("is_right", handedness)),
+            "source_track_ids": np.asarray(value.get("source_track_ids", []), dtype=np.int64),
+            "frames": np.asarray(value.get("frames", np.arange(T)), dtype=np.int64),
+            "keypoints": kpts,
+            "valid": np.asarray(value.get("valid", ~np.all(kpts == 0, axis=(1, 2))), dtype=bool),
+            "source_track_per_frame": np.asarray(
+                value.get("source_track_per_frame", np.full(T, -1)), dtype=np.int64
+            ),
+            "score": np.asarray(value.get("score", np.zeros(T)), dtype=np.float32),
+        }
+    return out
+
+
+def save_keypoints_npy(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, payload)
 
 
 @dataclass
 class Pose3DHandStageData:
     pose_path: Path
     track_info_path: Path
-    keypoints_root: Path
+    keypoints_npy: Path
     image_root: Path | None
     seq_name: str
     traj_convention: str
+    extract_keypoints: bool = False
     vitpose_config: Path | None = None
     vitpose_checkpoint: Path | None = None
     vitpose_device: str = "cuda:0"
-    reuse_keypoints: bool = True
 
     def __post_init__(self) -> None:
         self.payload = torch.load(self.pose_path, map_location="cpu", weights_only=False)
         self.track_info = load_track_info_npy(self.track_info_path)
-        self.track_ids = pick_tracks(self.track_info)
-        if len(self.track_ids) == 0:
-            self.track_ids = [0, 1]
         self.T = len(self.payload["left_hand"]["pred_valid"])
         self.seq_interval = (0, self.T)
+        self.track_ids = [0, 1]
+        self.keypoints_payload = self._load_or_create_keypoints()
         self._obs_cache: dict[str, Any] | None = None
 
     @property
     def n_tracks(self) -> int:
         return len(self.track_ids)
 
-    def _side_for_track(self, track_id: int) -> str:
-        return "right_hand" if self._handedness_for_track(track_id) == 1 else "left_hand"
+    def _load_or_create_keypoints(self) -> dict[int, dict[str, Any]]:
+        if self.keypoints_npy.is_file():
+            return load_keypoints_npy(self.keypoints_npy, self.T)
+        if not self.extract_keypoints:
+            raise FileNotFoundError(
+                f"keypoints_npy not found: {self.keypoints_npy}. Set data.extract_keypoints=true to generate it."
+            )
+        if self.image_root is None or self.vitpose_config is None or self.vitpose_checkpoint is None:
+            raise ValueError("image_root, vitpose_config, and vitpose_checkpoint are required to extract keypoints")
+        payload = extract_keypoints_from_track_info(
+            self.track_info,
+            self.T,
+            self.seq_name,
+            self.image_root,
+            self.vitpose_config,
+            self.vitpose_checkpoint,
+            self.vitpose_device,
+        )
+        save_keypoints_npy(self.keypoints_npy, payload)
+        return load_keypoints_npy(self.keypoints_npy, self.T)
 
-    def _handedness_for_track(self, track_id: int) -> int:
-        entries = self.track_info.get(track_id, [])
-        handed = None
-        for entry in entries:
-            if bool(entry.get("det", False)):
-                handed = int(round(float(entry.get("det_handedness", track_id))))
-                break
-        if handed is None:
-            handed = int(track_id)
-        return handed
+    def _side_for_track(self, track_id: int) -> str:
+        return "right_hand" if track_id == 1 else "left_hand"
 
     def _vis_mask_for_track(self, track_id: int, side: str) -> np.ndarray:
-        mask = np.zeros(self.T, dtype=bool)
-        for entry in self.track_info.get(track_id, []):
-            frame = int(entry["frame"])
-            if 0 <= frame < self.T and bool(entry.get("det", False)):
-                mask[frame] = True
+        keypoint_valid = self.keypoints_payload.get(track_id, {}).get("valid", np.zeros(self.T, dtype=bool))
         pred_valid = np.asarray(self.payload[side]["pred_valid"], dtype=bool)
-        return mask | pred_valid
+        return np.asarray(keypoint_valid, dtype=bool) | pred_valid
 
-    def _load_or_extract_keypoints(self, track_id: int) -> np.ndarray:
-        keypoints = np.zeros((self.T, OP_NUM_JOINTS, 3), dtype=np.float32)
-        valid = np.zeros(self.T, dtype=bool)
-        # Existing Dyn-HaMR keypoint caches use 000/001 hand folders, not raw
-        # track_info.npy ids such as 2 or 10000.
-        track_dir_id = self._handedness_for_track(track_id)
-        for entry in self.track_info.get(track_id, []):
-            frame = int(entry["frame"])
-            if frame < 0 or frame >= self.T or not bool(entry.get("det", False)):
-                continue
-            out_path = keypoint_path(self.keypoints_root, self.seq_name, track_dir_id, frame)
-            if self.reuse_keypoints and out_path.is_file():
-                kpts = read_keypoints(out_path)
-            else:
-                if self.image_root is None:
-                    kpts = np.zeros((OP_NUM_JOINTS, 3), dtype=np.float32)
-                else:
-                    image_path = self.image_root / f"{frame:06d}.jpg"
-                    if not image_path.is_file():
-                        image_path = self.image_root / f"{frame:06d}.png"
-                    kpts = run_vitpose_for_box(
-                        image_path,
-                        np.asarray(entry["det_box"], dtype=np.float32),
-                        self.vitpose_config,
-                        self.vitpose_checkpoint,
-                        self.vitpose_device,
-                    )
-                    write_keypoints(out_path, kpts)
-            keypoints[frame] = kpts
-            valid[frame] = not np.all(kpts == 0)
+    def _load_keypoints(self, track_id: int) -> np.ndarray:
+        if track_id not in self.keypoints_payload:
+            return np.zeros((self.T, OP_NUM_JOINTS, 3), dtype=np.float32)
+        keypoints = np.asarray(self.keypoints_payload[track_id]["keypoints"], dtype=np.float32)
+        valid = np.asarray(self.keypoints_payload[track_id]["valid"], dtype=bool)
         return interpolate_keypoints(keypoints, valid)
 
     def obs_data(self) -> dict[str, torch.Tensor | list[str]]:
@@ -303,7 +406,7 @@ class Pose3DHandStageData:
             ternary[:track_s] = -1
             ternary[track_e:] = -1
 
-            obs["joints2d"].append(self._load_or_extract_keypoints(track_id))
+            obs["joints2d"].append(self._load_keypoints(track_id))
             obs["vis_mask"].append(ternary)
             obs["is_right"].append(np.full(self.T, is_right, dtype=np.float32))
             obs["track_id"].append(track_id)
@@ -456,20 +559,13 @@ def payload_from_model(
     return payload
 
 
-def res_dict_from_payload(
-    payload: dict[str, Any],
-    track_ids: list[int],
-    track_info: dict[int, list[dict[str, Any]]],
-    traj_convention: str,
-) -> dict[str, torch.Tensor]:
+def res_dict_from_payload(payload: dict[str, Any], traj_convention: str) -> dict[str, torch.Tensor]:
     root_orient = []
     pose_body = []
     trans = []
     betas = []
     is_right = []
-    for track_id in track_ids:
-        entries = track_info.get(track_id, [])
-        handed = int(round(float(entries[0].get("det_handedness", track_id)))) if entries else int(track_id)
+    for handed in (0, 1):
         side = "right_hand" if handed == 1 else "left_hand"
         mano = payload[side]["mano_params"]
         root_orient.append(np.asarray(mano["global_orient"], dtype=np.float32))
@@ -486,7 +582,7 @@ def res_dict_from_payload(
     focal = _as_float(slam["img_focal"])
     center = np.asarray(slam["img_center"], dtype=np.float32).reshape(2)
     intrins = np.array([focal, focal, center[0], center[1]], dtype=np.float32)
-    B = len(track_ids)
+    B = 2
     return {
         "root_orient": torch.from_numpy(np.stack(root_orient)),
         "pose_body": torch.from_numpy(np.stack(pose_body)),
@@ -499,16 +595,14 @@ def res_dict_from_payload(
     }
 
 
-def payload_from_prior_result(base_payload: dict[str, Any], result: dict[str, np.ndarray], track_ids: list[int], track_info: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
+def payload_from_prior_result(base_payload: dict[str, Any], result: dict[str, np.ndarray]) -> dict[str, Any]:
     payload = {
         "left_hand": base_payload["left_hand"],
         "right_hand": base_payload["right_hand"],
         "slam_data": dict(base_payload["slam_data"]),
         "fps": float(base_payload.get("fps", 30.0)),
     }
-    for b, track_id in enumerate(track_ids):
-        entries = track_info.get(track_id, [])
-        handed = int(round(float(entries[0].get("det_handedness", track_id)))) if entries else int(track_id)
+    for b, handed in enumerate((0, 1)):
         side = "right_hand" if handed == 1 else "left_hand"
         pred_valid = np.asarray(base_payload[side]["pred_valid"], dtype=bool)
         payload[side] = hand_slot_from_arrays(
@@ -528,57 +622,58 @@ def latest_pose3d(stage_dir: Path) -> Path:
     return matches[-1]
 
 
-def stage_input(args: argparse.Namespace, stage: str) -> Path:
-    if stage == "root" or not args.resume:
-        return args.input_pose3d_hand
+def stage_input(cfg: DictConfig, stage: str) -> Path:
+    if stage == "root" or not bool(cfg.data.resume):
+        return resolve_path(cfg.data.pose3d_hand)
     previous = STAGE_ORDER[STAGE_ORDER.index(stage) - 1]
-    return latest_pose3d(args.work_dir / STAGE_DIR[previous])
+    return latest_pose3d(resolve_path(cfg.data.work_dir) / STAGE_DIR[previous])
 
 
-def build_cfg(args: argparse.Namespace) -> Any:
-    cfg = OmegaConf.load(_DYN_HAMR_ROOT / "confs" / "config.yaml")
-    optim_cfg = OmegaConf.load(_DYN_HAMR_ROOT / "confs" / "optim.yaml")
-    data_cfg = OmegaConf.load(_DYN_HAMR_ROOT / "confs" / "data" / f"{args.config_name}.yaml")
-    cfg = OmegaConf.merge(cfg, optim_cfg)
-    cfg.data = data_cfg
-    cfg.data.seq = args.seq_name
-    cfg.data.pose3d_hand = str(args.input_pose3d_hand)
-    cfg.data.track_info = str(args.track_info)
-    cfg.data.sources.keypoints = str(args.keypoints_root)
+def make_stage_data(cfg: DictConfig, stage: str) -> Pose3DHandStageData:
+    return Pose3DHandStageData(
+        pose_path=stage_input(cfg, stage),
+        track_info_path=resolve_path(cfg.data.track_info),
+        keypoints_npy=resolve_path(cfg.data.keypoints_npy),
+        image_root=resolve_path(cfg.data.image_root),
+        seq_name=str(cfg.data.seq),
+        traj_convention=str(cfg.data.traj_convention),
+        extract_keypoints=bool(cfg.data.extract_keypoints),
+        vitpose_config=resolve_path(cfg.data.vitpose_config),
+        vitpose_checkpoint=resolve_path(cfg.data.vitpose_checkpoint),
+        vitpose_device=str(cfg.data.get("device_override", f"cuda:{cfg.gpu}")),
+    )
+
+
+def prepare_cfg(cfg: DictConfig) -> DictConfig:
+    cfg = OmegaConf.create(OmegaConf.to_container(cfg, resolve=True))
     cfg.model.opt_cams = False
     cfg.model.opt_scale = False
     cfg.run_vis = False
     cfg.run_opt = False
-    cfg.paths.base_dir = str(_DYN_HAMR_ROOT.parent.resolve())
+    cfg.paths.base_dir = str(_REPO_ROOT.resolve())
     return resolve_cfg_paths(cfg)
 
 
-def make_body_model(cfg: Any, batch_size: int, device: torch.device) -> MANO:
+def make_body_model(cfg: DictConfig, batch_size: int, device: torch.device) -> MANO:
     mano_cfg = {k.lower(): v for k, v in dict(cfg.MANO).items()}
     return MANO(batch_size=batch_size, pose2rot=True, **mano_cfg).to(device)
 
 
-def stage_loss_weights(cfg: Any) -> list[dict[str, float]]:
+def stage_loss_weights(cfg: DictConfig) -> list[dict[str, float]]:
     weights = cfg.optim.loss_weights
     return [{k: weights[k][i] for k in weights.keys()} for i in range(3)]
 
 
-def run_root_or_smooth(args: argparse.Namespace, stage: str, cfg: Any, device: torch.device) -> Path:
+def run_root_or_smooth(cfg: DictConfig, stage: str, device: torch.device) -> Path:
     from optim.optimizers import RootOptimizer, SmoothOptimizer
 
-    input_path = stage_input(args, stage)
-    data = Pose3DHandStageData(
-        pose_path=input_path,
-        track_info_path=args.track_info,
-        keypoints_root=args.keypoints_root,
-        image_root=args.image_root,
-        seq_name=args.seq_name,
-        traj_convention=args.traj_convention,
-        vitpose_config=args.vitpose_config,
-        vitpose_checkpoint=args.vitpose_checkpoint,
-        vitpose_device=args.device,
-        reuse_keypoints=args.reuse_keypoints,
-    )
+    data = make_stage_data(cfg, stage)
+    num_iters = int(cfg.optim.root.num_iters if stage == "root" else cfg.optim.smooth.num_iters)
+    output = resolve_path(cfg.data.work_dir) / STAGE_DIR[stage] / f"{cfg.data.seq}_{num_iters:06d}.pose3d_hand"
+    if num_iters == 0:
+        Logger.log(f"Skipping {stage} optimization because num_iters=0")
+        return save_pose3d_payload(data.payload, output)
+
     obs_data = move_to(data.obs_data(), device)
     body_model = make_body_model(cfg, data.n_tracks * data.T, device)
     model = make_model(cfg, body_model, data, device)
@@ -586,53 +681,29 @@ def run_root_or_smooth(args: argparse.Namespace, stage: str, cfg: Any, device: t
     opt_kwargs = dict(cfg.optim.options)
     optimizer_cls = RootOptimizer if stage == "root" else SmoothOptimizer
     optimizer = optimizer_cls(model, all_loss_weights, **opt_kwargs)
-    num_iters = int(cfg.optim.root.num_iters if stage == "root" else cfg.optim.smooth.num_iters)
     Logger.log(f"Running {stage} for {num_iters} iterations")
     for i in range(num_iters):
         optimizer.cur_step = i
         optimizer.loss.cur_step = i
         optimizer.optim_step(obs_data, i)
     optimizer.cur_step = num_iters
-    payload = payload_from_model(data.payload, model, args.traj_convention)
-    output = args.work_dir / STAGE_DIR[stage] / f"{args.seq_name}_{num_iters:06d}.pose3d_hand"
+    payload = payload_from_model(data.payload, model, str(cfg.data.traj_convention))
     return save_pose3d_payload(payload, output)
 
 
-def run_prior_stage(args: argparse.Namespace, cfg: Any, device: torch.device) -> Path:
+def run_prior_stage(cfg: DictConfig, device: torch.device) -> Path:
     from HMP.fitting import fitting_prior
 
-    input_path = stage_input(args, "prior")
-    data = Pose3DHandStageData(
-        pose_path=input_path,
-        track_info_path=args.track_info,
-        keypoints_root=args.keypoints_root,
-        image_root=args.image_root,
-        seq_name=args.seq_name,
-        traj_convention=args.traj_convention,
-        vitpose_config=args.vitpose_config,
-        vitpose_checkpoint=args.vitpose_checkpoint,
-        vitpose_device=args.device,
-        reuse_keypoints=args.reuse_keypoints,
-    )
+    data = make_stage_data(cfg, "prior")
     obs_data = move_to(data.obs_data(), device)
     body_model = make_body_model(cfg, data.n_tracks * data.T, device)
-    prior_dir = args.work_dir / STAGE_DIR["prior"]
+    prior_dir = resolve_path(cfg.data.work_dir) / STAGE_DIR["prior"]
     prior_dir.mkdir(parents=True, exist_ok=True)
-    cfg.paths.base_dir = str(_DYN_HAMR_ROOT.parent.resolve())
-    cfg.HMP.exp_name = args.seq_name
+    cfg.paths.base_dir = str(_REPO_ROOT.resolve())
+    cfg.HMP.exp_name = str(cfg.data.seq)
     result = fitting_prior(
         obs_data,
-        (
-            move_to(
-                res_dict_from_payload(
-                    data.payload,
-                    data.track_ids,
-                    data.track_info,
-                    args.traj_convention,
-                ),
-                device,
-            ),
-        ),
+        (move_to(res_dict_from_payload(data.payload, str(cfg.data.traj_convention)), device),),
         body_model,
         cfg,
         cfg.data,
@@ -644,12 +715,12 @@ def run_prior_stage(args: argparse.Namespace, cfg: Any, device: torch.device) ->
     else:
         result_dict = result
     if result_dict is None:
-        npz_path = prior_dir / f"{args.seq_name}_000000_world_results.npz"
+        npz_path = prior_dir / f"{cfg.data.seq}_000000_world_results.npz"
         with np.load(npz_path, allow_pickle=False) as npz:
             result_dict = {k: npz[k] for k in npz.files}
     result_np = {k: _as_numpy(v) for k, v in result_dict.items()}
-    payload = payload_from_prior_result(data.payload, result_np, data.track_ids, data.track_info)
-    output = prior_dir / f"{args.seq_name}_000000.pose3d_hand"
+    payload = payload_from_prior_result(data.payload, result_np)
+    output = prior_dir / f"{cfg.data.seq}_000000.pose3d_hand"
     return save_pose3d_payload(payload, output)
 
 
@@ -659,81 +730,44 @@ def copy_final(src: Path, dst: Path) -> Path:
     return dst
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run RootOptimizer, SmoothOptimizer, and HMP prior using .pose3d_hand "
-            "as the stage input/output format.\n\n"
-            "Optimization variables:\n"
-            "  root: trans, root_orient\n"
-            "  smooth: trans, root_orient, betas, latent_pose; optional world_scale, cam_f, delta_cam_R\n"
-            "  prior: stg1 betas/trans/root_orient; stg2 betas/trans/root_orient/z_l; optional pose"
-        ),
-        epilog=(
-            "Configuration files:\n"
-            "  dyn-hamr/confs/data/video_new.yaml: pose3d_hand, track_info.npy, keypoint/image sources\n"
-            "  dyn-hamr/confs/optim.yaml: Root/Smooth iteration counts, optimizer options, loss weights\n"
-            "  dyn-hamr/confs/config.yaml: model.opt_cams/model.opt_scale defaults\n"
-            "  dyn-hamr/HMP/hmp_config.yaml: HMP prior stages stg1/stg2/stg3 and opt_params\n\n"
-            "pose3d_hand field mapping:\n"
-            "  trans -> mano_params.transl\n"
-            "  root_orient -> mano_params.global_orient\n"
-            "  betas -> mano_params.betas\n"
-            "  latent_pose/z_l decoded pose -> mano_params.hand_pose\n"
-            "  slam_data.traj is kept as the stage camera trajectory and converted to cam_R/cam_t only internally"
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("--input-pose3d-hand", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--stage", choices=("root", "smooth", "prior", "all"), default="all")
-    parser.add_argument("--work-dir", type=Path, required=True)
-    parser.add_argument("--seq-name", default=None)
-    parser.add_argument("--track-info", type=Path, required=True)
-    parser.add_argument("--keypoints-root", type=Path, required=True)
-    parser.add_argument("--image-root", type=Path, default=None)
-    parser.add_argument("--vitpose-config", type=Path, default=None)
-    parser.add_argument("--vitpose-checkpoint", type=Path, default=None)
-    parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--reuse-keypoints", action="store_true")
-    parser.add_argument("--traj-convention", choices=("c2w", "w2c"), default="c2w")
-    parser.add_argument("--config-name", default="video_new")
-    parser.add_argument("--resume", action="store_true")
-    return parser.parse_args()
+def select_device(cfg: DictConfig) -> torch.device:
+    override = cfg.data.get("device_override", None)
+    if override is not None:
+        device_name = str(override)
+    else:
+        device_name = f"cuda:{cfg.gpu}"
+    if device_name.startswith("cuda") and not torch.cuda.is_available():
+        device_name = "cpu"
+    return torch.device(device_name)
 
 
-def main() -> int:
-    args = parse_args()
-    args.input_pose3d_hand = args.input_pose3d_hand.expanduser().resolve()
-    args.output = args.output.expanduser().resolve()
-    args.work_dir = args.work_dir.expanduser().resolve()
-    args.track_info = args.track_info.expanduser().resolve()
-    args.keypoints_root = args.keypoints_root.expanduser().resolve()
-    args.image_root = args.image_root.expanduser().resolve() if args.image_root else None
-    args.vitpose_config = args.vitpose_config.expanduser().resolve() if args.vitpose_config else None
-    args.vitpose_checkpoint = (
-        args.vitpose_checkpoint.expanduser().resolve() if args.vitpose_checkpoint else None
-    )
-    args.seq_name = args.seq_name or infer_seq_name(args.input_pose3d_hand)
-    args.work_dir.mkdir(parents=True, exist_ok=True)
-    Logger.init(str(args.work_dir / "pose3d_hand_stages.log"))
-    cfg = build_cfg(args)
-    device = torch.device(args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu")
-
-    stages = STAGE_ORDER if args.stage == "all" else (args.stage,)
-    last_output = args.input_pose3d_hand
+def run_from_cfg(cfg: DictConfig) -> Path:
+    cfg = prepare_cfg(cfg)
+    work_dir = resolve_path(cfg.data.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    Logger.init(str(work_dir / "pose3d_hand_stages.log"))
+    device = select_device(cfg)
+    stages = STAGE_ORDER if str(cfg.data.stage) == "all" else (str(cfg.data.stage),)
+    last_output = resolve_path(cfg.data.pose3d_hand)
     for stage in stages:
         if stage in {"root", "smooth"}:
-            last_output = run_root_or_smooth(args, stage, cfg, device)
+            last_output = run_root_or_smooth(cfg, stage, device)
+        elif stage == "prior":
+            last_output = run_prior_stage(cfg, device)
         else:
-            last_output = run_prior_stage(args, cfg, device)
-        args.input_pose3d_hand = last_output
-        args.resume = False
+            raise ValueError(f"Unknown stage: {stage}")
+        cfg.data.pose3d_hand = str(last_output)
+        cfg.data.resume = False
+    final_output = copy_final(last_output, resolve_path(cfg.data.output))
+    print(f"Saved final pose3d_hand to {final_output}")
+    return final_output
 
-    copy_final(last_output, args.output)
-    print(f"Saved final pose3d_hand to {args.output}")
-    return 0
+
+@hydra.main(version_base=None, config_path="confs", config_name="config.yaml")
+def main(cfg: DictConfig) -> None:
+    OmegaConf.resolve(cfg)
+    run_from_cfg(cfg)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

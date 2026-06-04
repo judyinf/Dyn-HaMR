@@ -1,5 +1,5 @@
 defaults:
-  - data: HOT3D
+  - data: video_new
   - optim
   - _self_
 
@@ -13,7 +13,7 @@ overwrite: False
 run_opt: True
 run_vis: True
 run_prior: False
-datatype: ${data.video_dir}
+datatype: ${data.type}
 vis:
   phases:
     # - motion_chunks
