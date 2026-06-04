@@ -1,0 +1,28 @@
+type: video
+split: custom
+root: /Users/cyh/Projects/Dyn-HaMR/test/test
+video_dir: videos
+seq: segment_000_ch1_undistort
+ext: mp4
+src_path: ${data.root}/${data.video_dir}/${data.seq}.${data.ext}
+frame_opts:
+  ext: jpg
+  fps: 29
+  start_sec: 0
+  end_sec: -1
+use_cams: false
+camera_source: pose3d_hand.slam_data
+pose3d_hand: /Users/cyh/Projects/Dyn-HaMR/demo/segment_000_ch1_undistort.pose3d_hand
+track_info: /Users/cyh/Projects/Dyn-HaMR/demo/segment_000_ch1_undistort_track_info.npy
+track_ids: "all"
+shot_idx: 0
+start_idx: 0
+end_idx: -1
+split_cameras: false
+name: ${data.seq}-pose3d-hand
+sources:
+  images: ${data.root}/images/${data.seq}
+  cameras: ""
+  tracks: ${data.root}/dynhamr/track_preds/${data.seq}
+  keypoints: ${data.root}/dynhamr/track_preds/${data.seq}
+  shots: ${data.root}/dynhamr/shot_idcs/${data.seq}.json

@@ -15,7 +15,6 @@ from util.tensor import move_to, detach_all
 
 # from .helpers import estimate_initial_trans
 from .params import CameraParams
-import mano
 
 J_HAND = len(MANO_JOINTS) - 1  # no root
 

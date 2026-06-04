@@ -370,7 +370,11 @@ class RootLoss(StageLoss):
         self.joints2d_loss = Joints2DLoss(ignore_op_joints, joints2d_sigma)
         self.points3d_loss = Points3DLoss(use_chamfer, robust_loss, robust_tuning_const)
         self.inter_penetration_loss = GeneralContactLoss(faces)
-        self.bio_loss = BMCLoss(lambda_bl=1, lambda_rb=1, lambda_a=1)
+        self.bio_loss = (
+            BMCLoss(lambda_bl=1, lambda_rb=1, lambda_a=1)
+            if loss_weights.get("bio", 0.0) > 0.0
+            else None
+        )
 
     def forward(self, observed_data, pred_data, valid_mask=None):
         """
@@ -397,6 +401,8 @@ class RootLoss(StageLoss):
             and self.loss_weights["bio"] > 0.0
         ):
             # print('biobiobiobiobiobiobiobiobiobiobiobio')
+            if self.bio_loss is None:
+                self.bio_loss = BMCLoss(lambda_bl=1, lambda_rb=1, lambda_a=1)
             cur_loss, _ = self.bio_loss.compute_loss(
                 pred_data["joints3d"], valid_mask
             )

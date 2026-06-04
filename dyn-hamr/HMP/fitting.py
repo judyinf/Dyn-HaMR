@@ -897,6 +897,7 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
     for key in res_dict.keys():
         print(key, res_dict[key].shape)
     np.savez(pred_save_path, **res_dict)
+    return res_dict, pred_save_path
 
 def run_quantitative_evaluation(pred_npz_path, gt_dict, pymafx_npz_path, viz_flag, misc={}):
 
@@ -1673,6 +1674,12 @@ def run_prior(
     obs_data, hand_model, opt, data_args, prior_out, 
     save_dir=None
 ):
+    """
+    Stage III: HMP motion-prior refinement after smooth_fit.
+
+    Requires smooth_fit *_world_results.npz plus obs_data keys joints2d, vis_mask,
+    is_right. See dyn-hamr/docs/run_prior_inputs.md.
+    """
 
     def load_result(res_path_dict):
         def to_torch(obj):

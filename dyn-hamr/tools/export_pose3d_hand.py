@@ -312,6 +312,82 @@ def _camera_traj_for_timeline(
     return _camera_traj_from_arrays(cam_t, cam_R)
 
 
+def _infer_seq_name(result_path: Path, output: Path) -> str:
+    stem = result_path.name
+    for suffix in ("_world_results.npz", "_results.npz"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    parts = stem.split("_")
+    if len(parts) > 1 and parts[-1].isdigit():
+        stem = "_".join(parts[:-1])
+    if stem:
+        return stem
+
+    out_stem = output.name
+    if out_stem.endswith(".pose3d_hand"):
+        out_stem = out_stem[: -len(".pose3d_hand")]
+    if out_stem.endswith("_export"):
+        out_stem = out_stem[: -len("_export")]
+    return out_stem
+
+
+def load_vipe_pose3d_camera(
+    vipe_dir: Path,
+    seq_name: str,
+    timeline: Timeline | None,
+) -> dict[str, np.ndarray]:
+    pose_path = vipe_dir / "pose" / f"{seq_name}.npz"
+    intrins_path = vipe_dir / "intrinsics" / f"{seq_name}.npz"
+    if not pose_path.is_file():
+        raise FileNotFoundError(f"VIPE pose file not found: {pose_path}")
+    if not intrins_path.is_file():
+        raise FileNotFoundError(f"VIPE intrinsics file not found: {intrins_path}")
+
+    with np.load(pose_path, allow_pickle=False) as pose_data:
+        c2w = np.asarray(pose_data["data"], dtype=np.float32)
+        pose_inds = np.asarray(pose_data["inds"], dtype=np.int64)
+    with np.load(intrins_path, allow_pickle=False) as intrins_data:
+        intrins = np.asarray(intrins_data["data"], dtype=np.float64)
+        intrins_inds = np.asarray(intrins_data["inds"], dtype=np.int64)
+
+    if not np.array_equal(pose_inds, intrins_inds):
+        raise ValueError(
+            f"VIPE pose/intrinsics indices do not match for sequence {seq_name}"
+        )
+    if c2w.ndim != 3 or c2w.shape[1:] != (4, 4):
+        raise ValueError(f"VIPE pose data must have shape (N, 4, 4), got {c2w.shape}")
+    if intrins.ndim != 2 or intrins.shape[1] < 4:
+        raise ValueError(f"VIPE intrinsics data must have shape (N, 4+), got {intrins.shape}")
+
+    if timeline is None:
+        selected = np.arange(len(pose_inds))
+    else:
+        desired = np.arange(timeline.data_start, timeline.data_end, dtype=np.int64)
+        index_by_frame = {int(frame): idx for idx, frame in enumerate(pose_inds.tolist())}
+        missing = [int(frame) for frame in desired if int(frame) not in index_by_frame]
+        if missing:
+            preview = missing[:10]
+            raise ValueError(
+                f"VIPE results for {seq_name} do not cover data_interval "
+                f"({timeline.data_start}, {timeline.data_end}); missing frames {preview}"
+            )
+        selected = np.asarray([index_by_frame[int(frame)] for frame in desired], dtype=np.int64)
+
+    c2w_sel = c2w[selected]
+    intrins_sel = intrins[selected, :4]
+    traj = _camera_traj_from_arrays(c2w_sel[:, :3, 3], c2w_sel[:, :3, :3])
+    focal = float((intrins_sel[0, 0] + intrins_sel[0, 1]) / 2.0)
+    center = intrins_sel[0, 2:4].astype(np.float64)
+    return {
+        "traj": traj,
+        "img_focal": np.array(focal, dtype=np.float64),
+        "img_center": center,
+        "intrins": intrins_sel,
+        "inds": pose_inds[selected],
+    }
+
+
 def _slam_tstamp(seq_len: int, max_keyframes: int) -> np.ndarray:
     if seq_len <= 0:
         return np.zeros(0, dtype=np.int32)
@@ -365,6 +441,8 @@ def build_pose3d_hand(
     max_slam_frames: int,
     slam_overlap_frames: int,
     timeline: Timeline | None,
+    vipe_camera: dict[str, np.ndarray] | None,
+    use_vipe_intrinsics: bool,
 ) -> dict:
     trans = _as_batch_array(data["trans"])
     B, seq_len = trans.shape[0], trans.shape[1]
@@ -438,11 +516,19 @@ def build_pose3d_hand(
     focal, center = _intrinsics_from_npz(data, traj_batch)
     fps_value = _optional_scalar(data, ("fps",), fps, traj_batch)
     scale_value = _optional_scalar(data, ("scale", "world_scale"), 1.0, traj_batch)
-    traj = (
-        _camera_traj_for_timeline(data, traj_batch, timeline)
-        if timeline is not None
-        else _camera_traj(data, traj_batch, seq_len)
-    )
+    if vipe_camera is not None:
+        traj = vipe_camera["traj"]
+        if traj.shape[0] != out_len:
+            raise ValueError(f"VIPE traj T={traj.shape[0]} does not match output T={out_len}")
+        if use_vipe_intrinsics:
+            focal = _as_float_scalar(vipe_camera["img_focal"])
+            center = np.asarray(vipe_camera["img_center"], dtype=np.float64)
+    else:
+        traj = (
+            _camera_traj_for_timeline(data, traj_batch, timeline)
+            if timeline is not None
+            else _camera_traj(data, traj_batch, seq_len)
+        )
     slam_data = {
         "tstamp": _slam_tstamp(out_len, max_slam_keyframes),
         "traj": traj,
@@ -471,6 +557,9 @@ def export_pose3d_hand(
     max_slam_keyframes: int,
     max_slam_frames: int,
     slam_overlap_frames: int,
+    vipe_dir: Path | None,
+    seq_name: str | None,
+    use_vipe_intrinsics: bool,
     result_path: Path | None = None,
 ) -> Path:
     npz_path = result_path or find_latest_result(log_dir, phase)
@@ -506,6 +595,11 @@ def export_pose3d_hand(
         for tid, mask in zip(track_ids_list, vis_masks.tolist()):
             track_vis_masks[tid] = np.asarray(mask)
 
+    vipe_camera = None
+    if vipe_dir is not None:
+        resolved_seq_name = seq_name or _infer_seq_name(npz_path, output)
+        vipe_camera = load_vipe_pose3d_camera(vipe_dir, resolved_seq_name, timeline)
+
     payload = build_pose3d_hand(
         data,
         track_vis_masks,
@@ -516,6 +610,8 @@ def export_pose3d_hand(
         max_slam_frames=max_slam_frames,
         slam_overlap_frames=slam_overlap_frames,
         timeline=timeline,
+        vipe_camera=vipe_camera,
+        use_vipe_intrinsics=use_vipe_intrinsics,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -583,6 +679,22 @@ def parse_args() -> argparse.Namespace:
         default=30,
         help="Overlap frames between SLAM chunks metadata field (default 30)",
     )
+    parser.add_argument(
+        "--vipe-dir",
+        type=Path,
+        default=None,
+        help="Optional VIPE results directory containing pose/ and intrinsics/",
+    )
+    parser.add_argument(
+        "--seq-name",
+        default=None,
+        help="Sequence name for VIPE files; inferred from --result when omitted",
+    )
+    parser.add_argument(
+        "--use-vipe-intrinsics",
+        action="store_true",
+        help="Use VIPE intrinsics for slam_data.img_focal/img_center when --vipe-dir is set",
+    )
     return parser.parse_args()
 
 
@@ -603,6 +715,9 @@ def main() -> int:
             max_slam_keyframes=args.max_slam_keyframes,
             max_slam_frames=args.max_slam_frames,
             slam_overlap_frames=args.slam_overlap_frames,
+            vipe_dir=args.vipe_dir.expanduser().resolve() if args.vipe_dir else None,
+            seq_name=args.seq_name,
+            use_vipe_intrinsics=args.use_vipe_intrinsics,
             result_path=args.result.expanduser().resolve() if args.result else None,
         )
     except (FileNotFoundError, ValueError, KeyError) as exc:
