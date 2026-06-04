@@ -1066,6 +1066,56 @@ def ensure_keypoint_frames(cfg: DictConfig) -> None:
         raise RuntimeError(f"Failed to extract frames from {src_path} to {image_root}")
 
 
+def has_image_frames(path: Path) -> bool:
+    return path.is_dir() and any(path.glob("*.jpg")) or path.is_dir() and any(path.glob("*.png"))
+
+
+def read_video_fps(path: Path) -> float:
+    try:
+        import cv2
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("OpenCV is required to read video FPS when frame_opts.fps=auto") from exc
+    capture = cv2.VideoCapture(str(path))
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+    finally:
+        capture.release()
+    if not np.isfinite(fps) or fps <= 0:
+        raise RuntimeError(f"Could not read a valid FPS from {path}")
+    return fps
+
+
+def ensure_keypoint_frames(cfg: DictConfig) -> None:
+    if not bool(cfg.data.get("extract_keypoints", False)):
+        return
+    keypoints_path = resolve_path(cfg.data.keypoints_npy)
+    if keypoints_path.is_file() and bool(cfg.data.get("reuse_keypoints_npy", True)):
+        return
+
+    image_root = resolve_path(cfg.data.image_root)
+    if image_root is None:
+        raise ValueError("data.image_root is required when extracting keypoints")
+    if has_image_frames(image_root):
+        return
+
+    src_path = resolve_path(cfg.data.get("src_path", None))
+    if src_path is None or not src_path.is_file():
+        raise FileNotFoundError(f"Cannot extract frames; data.src_path is not a file: {src_path}")
+
+    frame_opts = OmegaConf.to_container(cfg.data.get("frame_opts", {}), resolve=True)
+    frame_opts = dict(frame_opts) if frame_opts is not None else {}
+    fps = frame_opts.get("fps", 30)
+    if fps is None or str(fps).lower() == "auto":
+        fps = read_video_fps(src_path)
+        frame_opts["fps"] = fps
+
+    image_root.mkdir(parents=True, exist_ok=True)
+    print(f"Extracting keypoint frames from {src_path} to {image_root} at {fps} fps")
+    out = video_to_frames(src_path, image_root, **frame_opts)
+    if out != 0:
+        raise RuntimeError(f"Failed to extract frames from {src_path} to {image_root}")
+
+
 def make_body_model(cfg: DictConfig, batch_size: int, device: torch.device) -> MANO:
     mano_cfg = {k.lower(): v for k, v in dict(cfg.MANO).items()}
     return MANO(batch_size=batch_size, pose2rot=True, **mano_cfg).to(device)
