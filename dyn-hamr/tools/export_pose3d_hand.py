@@ -46,6 +46,13 @@ def _as_batch_array(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _as_float_scalar(value: np.ndarray | float | int) -> float:
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("Cannot read scalar from an empty array")
+    return float(arr[0])
+
+
 def _pred_valid_from_vis_mask(vis_mask: np.ndarray, seq_len: int) -> np.ndarray:
     mask = np.asarray(vis_mask, dtype=np.float32).reshape(-1)
     seq_start, seq_end = 0, seq_len
@@ -101,12 +108,13 @@ def _compute_relative_motion(
 
 
 def _empty_hand(seq_len: int) -> dict:
+    pred_valid = np.zeros(seq_len, dtype=bool)
     return {
         "mano_params": {
-            "global_orient": torch.zeros(seq_len, 3, dtype=torch.float32),
-            "hand_pose": torch.zeros(seq_len, 45, dtype=torch.float32),
-            "betas": torch.zeros(seq_len, 10, dtype=torch.float32),
-            "transl": torch.zeros(seq_len, 3, dtype=torch.float32),
+            "global_orient": np.zeros((seq_len, 3), dtype=np.float32),
+            "hand_pose": np.zeros((seq_len, 45), dtype=np.float32),
+            "betas": np.zeros((seq_len, 10), dtype=np.float32),
+            "transl": np.zeros((seq_len, 3), dtype=np.float32),
         },
         "relative_motion": {
             "rel_rot_aa": torch.zeros(seq_len, 3, dtype=torch.float32),
@@ -116,7 +124,8 @@ def _empty_hand(seq_len: int) -> dict:
             "rel_trans": torch.zeros(seq_len, 3, dtype=torch.float32),
             "pair_valid": torch.zeros(seq_len, dtype=torch.bool),
         },
-        "pred_valid": torch.zeros(seq_len, dtype=torch.bool),
+        "pred_valid": pred_valid,
+        "detection_failed": ~pred_valid,
     }
 
 
@@ -128,21 +137,26 @@ def build_hand_slot(
     pred_valid: np.ndarray,
 ) -> dict:
     T = trans.shape[0]
-    global_orient = torch.from_numpy(np.asarray(root_orient, dtype=np.float32)).reshape(T, 3)
-    hand_pose = torch.from_numpy(np.asarray(pose_body, dtype=np.float32)).reshape(T, 45)
-    transl = torch.from_numpy(np.asarray(trans, dtype=np.float32)).reshape(T, 3)
-    betas_t = torch.from_numpy(_betas_per_frame(betas, T))
-    pred_valid_t = torch.from_numpy(np.asarray(pred_valid, dtype=bool))
+    global_orient = np.asarray(root_orient, dtype=np.float32).reshape(T, 3)
+    hand_pose = np.asarray(pose_body, dtype=np.float32).reshape(T, 45)
+    transl = np.asarray(trans, dtype=np.float32).reshape(T, 3)
+    betas_arr = _betas_per_frame(betas, T)
+    pred_valid_arr = np.asarray(pred_valid, dtype=bool)
+
+    global_orient_t = torch.from_numpy(global_orient)
+    transl_t = torch.from_numpy(transl)
+    pred_valid_t = torch.from_numpy(pred_valid_arr)
 
     return {
         "mano_params": {
             "global_orient": global_orient,
             "hand_pose": hand_pose,
-            "betas": betas_t,
+            "betas": betas_arr,
             "transl": transl,
         },
-        "relative_motion": _compute_relative_motion(global_orient, transl, pred_valid_t),
-        "pred_valid": pred_valid_t,
+        "relative_motion": _compute_relative_motion(global_orient_t, transl_t, pred_valid_t),
+        "pred_valid": pred_valid_arr,
+        "detection_failed": ~pred_valid_arr,
     }
 
 
@@ -180,27 +194,56 @@ def _camera_track_array(
         ) from exc
 
 
-def _camera_traj(data: dict[str, np.ndarray], batch_idx: int, seq_len: int) -> torch.Tensor:
+def _camera_traj(data: dict[str, np.ndarray], batch_idx: int, seq_len: int) -> np.ndarray:
     cam_t = torch.from_numpy(_camera_track_array(data["cam_t"], batch_idx, seq_len, (3,)))
     cam_R = torch.from_numpy(_camera_track_array(data["cam_R"], batch_idx, seq_len, (3, 3)))
     quat_wxyz = matrix_to_quaternion(cam_R)
     quat_xyzw = torch.cat([quat_wxyz[..., 1:], quat_wxyz[..., :1]], dim=-1)
-    return torch.cat([cam_t, quat_xyzw], dim=-1).to(dtype=torch.float32)
+    traj = torch.cat([cam_t, quat_xyzw], dim=-1).to(dtype=torch.float32)
+    return traj.numpy()
 
 
-def _slam_tstamp(seq_len: int, max_keyframes: int) -> torch.Tensor:
+def _slam_tstamp(seq_len: int, max_keyframes: int) -> np.ndarray:
     if seq_len <= 0:
-        return torch.zeros(0, dtype=torch.int32)
+        return np.zeros(0, dtype=np.int32)
     if seq_len <= max_keyframes:
-        return torch.arange(seq_len, dtype=torch.int32)
+        return np.arange(seq_len, dtype=np.int32)
     if max_keyframes <= 1:
-        return torch.tensor([0], dtype=torch.int32)
+        return np.array([0], dtype=np.int32)
     step = max(1, seq_len // (max_keyframes - 1))
-    tstamp = torch.arange(0, seq_len, step, dtype=torch.int32)[:max_keyframes]
-    if tstamp.numel() < max_keyframes:
-        tail = torch.tensor([seq_len - 1], dtype=torch.int32)
-        tstamp = torch.unique(torch.cat([tstamp, tail]), sorted=True)
+    tstamp = np.arange(0, seq_len, step, dtype=np.int32)[:max_keyframes]
+    if tstamp.size < max_keyframes:
+        tstamp = np.unique(np.concatenate([tstamp, np.array([seq_len - 1], dtype=np.int32)]))
     return tstamp[:max_keyframes]
+
+
+def _slam_n_chunks(seq_len: int, max_slam_frames: int, slam_overlap_frames: int) -> int:
+    if max_slam_frames <= 0:
+        raise ValueError("--max-slam-frames must be positive")
+    if slam_overlap_frames < 0:
+        raise ValueError("--slam-overlap-frames must be non-negative")
+    if slam_overlap_frames >= max_slam_frames:
+        raise ValueError("--slam-overlap-frames must be smaller than --max-slam-frames")
+    if seq_len <= max_slam_frames:
+        return 1
+    stride = max_slam_frames - slam_overlap_frames
+    return int(np.ceil((seq_len - slam_overlap_frames) / stride))
+
+
+def _optional_scalar(
+    data: dict[str, np.ndarray],
+    keys: tuple[str, ...],
+    default: float,
+    batch_idx: int = 0,
+) -> float:
+    for key in keys:
+        if key not in data:
+            continue
+        value = np.asarray(data[key], dtype=np.float64)
+        if value.ndim > 0 and value.shape[0] > batch_idx and value.size > 1:
+            value = value[batch_idx]
+        return _as_float_scalar(value)
+    return float(default)
 
 
 def build_pose3d_hand(
@@ -209,8 +252,9 @@ def build_pose3d_hand(
     track_ids: list[int] | None,
     fps: float,
     prefer_track_index: int | None,
-    disp_size: int,
     max_slam_keyframes: int,
+    max_slam_frames: int,
+    slam_overlap_frames: int,
 ) -> dict:
     trans = _as_batch_array(data["trans"])
     B, seq_len = trans.shape[0], trans.shape[1]
@@ -270,17 +314,21 @@ def build_pose3d_hand(
 
     traj_batch = export_indices[0] if export_indices else 0
     focal, center = _intrinsics_from_npz(data, traj_batch)
+    fps_value = _optional_scalar(data, ("fps",), fps, traj_batch)
+    scale_value = _optional_scalar(data, ("scale", "world_scale"), 1.0, traj_batch)
     slam_data = {
         "tstamp": _slam_tstamp(seq_len, max_slam_keyframes),
-        "disps": torch.zeros(1, disp_size, disp_size, dtype=torch.float32),
         "traj": _camera_traj(data, traj_batch, seq_len),
-        "img_focal": torch.tensor(focal, dtype=torch.float64),
-        "img_center": torch.from_numpy(center),
-        "scale": torch.tensor(1.0, dtype=torch.float64),
+        "img_focal": np.array(focal, dtype=np.float64),
+        "img_center": center.astype(np.float64),
+        "scale": np.array(scale_value, dtype=np.float64),
+        "slam_n_chunks": _slam_n_chunks(seq_len, max_slam_frames, slam_overlap_frames),
+        "max_slam_frames": int(max_slam_frames),
+        "slam_overlap_frames": int(slam_overlap_frames),
     }
 
     return {
-        "fps": float(fps),
+        "fps": float(fps_value),
         "left_hand": left_hand,
         "right_hand": right_hand,
         "slam_data": slam_data,
@@ -293,8 +341,9 @@ def export_pose3d_hand(
     output: Path,
     fps: float,
     prefer_track_index: int | None,
-    disp_size: int,
     max_slam_keyframes: int,
+    max_slam_frames: int,
+    slam_overlap_frames: int,
     result_path: Path | None = None,
 ) -> Path:
     npz_path = result_path or find_latest_result(log_dir, phase)
@@ -336,8 +385,9 @@ def export_pose3d_hand(
         track_ids_list,
         fps=fps,
         prefer_track_index=prefer_track_index,
-        disp_size=disp_size,
         max_slam_keyframes=max_slam_keyframes,
+        max_slam_frames=max_slam_frames,
+        slam_overlap_frames=slam_overlap_frames,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -385,13 +435,25 @@ def parse_args() -> argparse.Namespace:
         "--disp-size",
         type=int,
         default=512,
-        help="Placeholder disps spatial size (default 512)",
+        help="Deprecated no-op; disps is not emitted by default",
     )
     parser.add_argument(
         "--max-slam-keyframes",
         type=int,
         default=21,
         help="Maximum sparse slam_data.tstamp entries to emit (default 21)",
+    )
+    parser.add_argument(
+        "--max-slam-frames",
+        type=int,
+        default=900,
+        help="Maximum frames per SLAM chunk metadata field (default 900)",
+    )
+    parser.add_argument(
+        "--slam-overlap-frames",
+        type=int,
+        default=30,
+        help="Overlap frames between SLAM chunks metadata field (default 30)",
     )
     return parser.parse_args()
 
@@ -410,8 +472,9 @@ def main() -> int:
             output=args.output.expanduser().resolve(),
             fps=args.fps,
             prefer_track_index=args.prefer_track_index,
-            disp_size=args.disp_size,
             max_slam_keyframes=args.max_slam_keyframes,
+            max_slam_frames=args.max_slam_frames,
+            slam_overlap_frames=args.slam_overlap_frames,
             result_path=args.result.expanduser().resolve() if args.result else None,
         )
     except (FileNotFoundError, ValueError, KeyError) as exc:
