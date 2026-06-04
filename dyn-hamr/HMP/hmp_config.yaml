@@ -72,7 +72,7 @@ overlap_len: 16
 pretrained_gmp: false
 save_dir: _DATA/hmp_model
 temporal_filter:
-  type: none
+  type: none # 可改为 one_euro
   min_cutoff: 0.004
   beta: 0.7
 

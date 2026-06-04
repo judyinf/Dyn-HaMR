@@ -235,7 +235,7 @@ python run_vis.py \
 ```
 On macOS, `run_vis.py` automatically uses the local OpenGL context instead of Linux EGL. PyTorch rendering preparation falls back to CPU when CUDA is unavailable.
 
-As a multi-stage pipeline, you can customize the optimization process. Add `is_static=True` for static camera videos. Adding `run_prior=True` can activate the motion prior in stage III. Please note that in the current version, each motion chunk size needs to be set to 128 to be compatible with the original setting of HMP only when the prior module is activated.
+As a multi-stage pipeline, you can customize the optimization process. Add `is_static=True` for static camera videos. Adding `run_prior=True` can activate the motion prior in stage III. Please note that in the current version, each motion chunk size needs to be set to 128 to be compatible with the original setting of HMP only when the prior module is activated. See [dyn-hamr/docs/run_prior_inputs.md](dyn-hamr/docs/run_prior_inputs.md) for required inputs (including `joints2d` from `_keypoints.json` and `smooth_fit` checkpoints).
 
 ### Blender Addon
 Coming soon.
