@@ -977,6 +977,7 @@ def prepare_cfg(cfg: DictConfig) -> DictConfig:
     cfg.paths.base_dir = str(_REPO_ROOT.resolve())
     cfg = resolve_cfg_paths(cfg)
     return cfg
+<<<<<<< HEAD
 
 
 def snapshot_work_dir_config(cfg: DictConfig, work_dir: Path) -> None:
@@ -1064,6 +1065,8 @@ def ensure_keypoint_frames(cfg: DictConfig) -> None:
     out = video_to_frames(src_path, image_root, **frame_opts)
     if out != 0:
         raise RuntimeError(f"Failed to extract frames from {src_path} to {image_root}")
+=======
+>>>>>>> af015a6 (Refactor pose3d_hand processing and enhance camera trajectory functions)
 
 
 def has_image_frames(path: Path) -> bool:
