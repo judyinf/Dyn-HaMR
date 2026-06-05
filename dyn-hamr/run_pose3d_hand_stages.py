@@ -1069,6 +1069,43 @@ def ensure_keypoint_frames(cfg: DictConfig) -> None:
 >>>>>>> af015a6 (Refactor pose3d_hand processing and enhance camera trajectory functions)
 
 
+def snapshot_work_dir_config(cfg: DictConfig, work_dir: Path) -> None:
+    if not bool(cfg.get("snapshot_config", True)):
+        return
+    hydra_dir = work_dir / ".hydra"
+    hydra_dir.mkdir(parents=True, exist_ok=True)
+    OmegaConf.save(cfg, hydra_dir / "config.yaml")
+    for name in ("overrides.yaml", "hydra.yaml"):
+        src = Path.cwd() / ".hydra" / name
+        if src.is_file():
+            shutil.copy2(src, hydra_dir / name)
+    Logger.log(f"Saved config snapshot to {hydra_dir}")
+
+
+def collect_prior_loss_plots(prior_dir: Path, cfg: DictConfig) -> None:
+    if not bool(cfg.data.save_loss_plots):
+        return
+    summary_candidates = sorted(prior_dir.rglob("all_stages_loss.jpg"))
+    if summary_candidates:
+        dst = prior_dir / "all_stages_loss.jpg"
+        src = summary_candidates[-1]
+        if src.resolve() != dst.resolve():
+            shutil.copy2(src, dst)
+        Logger.log(f"Collected prior loss summary to {dst}")
+    else:
+        Logger.log(f"WARNING: no all_stages_loss.jpg found under {prior_dir}")
+
+    for src in sorted(prior_dir.rglob("stage_*_loss.jpg")):
+        if src.parent.resolve() == prior_dir.resolve():
+            continue
+        rel = src.relative_to(prior_dir)
+        dst = prior_dir / "_".join(rel.parts)
+        if dst.resolve() == src.resolve() or dst.is_file():
+            continue
+        shutil.copy2(src, dst)
+        Logger.log(f"Collected prior stage loss plot to {dst}")
+
+
 def has_image_frames(path: Path) -> bool:
     return path.is_dir() and any(path.glob("*.jpg")) or path.is_dir() and any(path.glob("*.png"))
 
