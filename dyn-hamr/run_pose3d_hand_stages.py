@@ -73,23 +73,26 @@ def _slam_scale_value(slam: dict) -> float:
 
 def slam_traj_to_camera_unscaled(traj: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    traj layout: [:3] unscaled camera center t_c2w, [3:7] R_w2c quaternion (xyzw).
-    Returns unscaled (R_w2c, cam_t) with cam_t = -R_w2c @ t_c2w.
+    Native pose3d_hand traj layout:
+    [:3] unscaled camera center C_world, [3:7] R_c2w quaternion (xyzw).
+    Returns unscaled internal camera extrinsics (R_w2c, t_w2c).
     """
     traj = np.asarray(traj, dtype=np.float32).reshape(-1, 7)
-    cam_R = quat_xyzw_to_matrix(traj[:, 3:7])
-    t_c2w = traj[:, :3]
-    cam_t = -np.einsum("tij,tj->ti", cam_R, t_c2w)
+    R_c2w = quat_xyzw_to_matrix(traj[:, 3:7])
+    cam_R = np.swapaxes(R_c2w, -1, -2)
+    center_world = traj[:, :3]
+    cam_t = -np.einsum("tij,tj->ti", cam_R, center_world)
     return cam_R.astype(np.float32), cam_t.astype(np.float32)
 
 
 def camera_to_slam_traj_unscaled(cam_R: np.ndarray, cam_t: np.ndarray) -> np.ndarray:
-    """Inverse of slam_traj_to_camera_unscaled; does not apply scale."""
+    """Write native pose3d_hand C_world + R_c2w traj; does not apply scale."""
     cam_R = np.asarray(cam_R, dtype=np.float32).reshape(-1, 3, 3)
     cam_t = np.asarray(cam_t, dtype=np.float32).reshape(-1, 3)
-    t_c2w = -np.einsum("tij,tj->ti", np.swapaxes(cam_R, -1, -2), cam_t)
-    quat = matrix_to_quat_xyzw(cam_R)
-    return np.concatenate([t_c2w.astype(np.float32), quat], axis=-1).astype(np.float32)
+    R_c2w = np.swapaxes(cam_R, -1, -2)
+    center_world = -np.einsum("tij,tj->ti", R_c2w, cam_t)
+    quat = matrix_to_quat_xyzw(R_c2w)
+    return np.concatenate([center_world.astype(np.float32), quat], axis=-1).astype(np.float32)
 
 
 def slam_traj_to_camera_scaled(traj: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray]:
@@ -128,6 +131,64 @@ def _compute_relative_motion(
         "rel_rot_aa": rel_rot_aa,
         "pair_valid": pair_valid,
     }
+
+
+def _mirror_axis_angle_x(axis_angle: np.ndarray) -> np.ndarray:
+    """Mirror rotations through the x axis: R' = M @ R @ M."""
+    arr = np.asarray(axis_angle, dtype=np.float32)
+    flat = arr.reshape(-1, 3)
+    rot = Rotation.from_rotvec(flat.astype(np.float64)).as_matrix()
+    mirror = np.diag([-1.0, 1.0, 1.0])
+    mirrored = mirror[None] @ rot @ mirror[None]
+    return Rotation.from_matrix(mirrored).as_rotvec().reshape(arr.shape).astype(np.float32)
+
+
+def _convert_left_mano_between_native_and_internal(
+    global_orient: np.ndarray,
+    hand_pose: np.ndarray,
+    transl: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Self-inverse conversion between native MANO_LEFT and Dyn-HaMR internal left-hand params."""
+    global_orient = _mirror_axis_angle_x(global_orient)
+    hand_pose = _mirror_axis_angle_x(np.asarray(hand_pose, dtype=np.float32).reshape(-1, 3)).reshape(
+        np.asarray(hand_pose).shape
+    )
+    transl = np.asarray(transl, dtype=np.float32).copy()
+    transl[..., 0] *= -1.0
+    return global_orient, hand_pose.astype(np.float32), transl
+
+
+def mano_params_native_to_internal(
+    mano: dict[str, Any],
+    is_right: bool,
+) -> dict[str, np.ndarray]:
+    global_orient = np.asarray(mano["global_orient"], dtype=np.float32)
+    hand_pose = np.asarray(mano["hand_pose"], dtype=np.float32)
+    transl = np.asarray(mano["transl"], dtype=np.float32)
+    if not is_right:
+        global_orient, hand_pose, transl = _convert_left_mano_between_native_and_internal(
+            global_orient, hand_pose, transl
+        )
+    return {
+        "global_orient": global_orient,
+        "hand_pose": hand_pose,
+        "betas": np.asarray(mano["betas"], dtype=np.float32),
+        "transl": transl,
+    }
+
+
+def mano_arrays_internal_to_native(
+    global_orient: np.ndarray,
+    hand_pose: np.ndarray,
+    transl: np.ndarray,
+    is_right: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    global_orient = np.asarray(global_orient, dtype=np.float32)
+    hand_pose = np.asarray(hand_pose, dtype=np.float32)
+    transl = np.asarray(transl, dtype=np.float32)
+    if not is_right:
+        return _convert_left_mano_between_native_and_internal(global_orient, hand_pose, transl)
+    return global_orient, hand_pose, transl
 
 
 def infer_seq_name(path: Path) -> str:
@@ -489,7 +550,9 @@ def init_body_pose_from_pose_path(pose_path: Path) -> torch.Tensor:
     payload = load_pose3d_payload(pose_path)
     poses = []
     for side in ("left_hand", "right_hand"):
-        hp = np.asarray(payload[side]["mano_params"]["hand_pose"], dtype=np.float32)
+        is_right = side == "right_hand"
+        mano = mano_params_native_to_internal(payload[side]["mano_params"], is_right=is_right)
+        hp = np.asarray(mano["hand_pose"], dtype=np.float32)
         if hp.ndim == 2:
             hp = hp.reshape(hp.shape[0], 15, 3)
         elif hp.ndim == 3 and hp.shape[-1] != 3:
@@ -632,8 +695,11 @@ class Pose3DHandStageData:
         }
         for track_id in self.track_ids:
             side = self._side_for_track(track_id)
-            mano = self.payload[side]["mano_params"]
             is_right = 1.0 if side == "right_hand" else 0.0
+            mano = mano_params_native_to_internal(
+                self.payload[side]["mano_params"],
+                is_right=bool(is_right),
+            )
             vis_mask = self._vis_mask_for_track(track_id, side)
             valid_idx = np.where(vis_mask)[0]
             track_s = int(valid_idx[0]) if valid_idx.size else 0
@@ -743,10 +809,17 @@ def hand_slot_from_arrays(
     betas: np.ndarray,
     transl: np.ndarray,
     pred_valid: np.ndarray,
+    is_right: bool,
 ) -> dict[str, Any]:
     global_orient = np.asarray(global_orient, dtype=np.float32).reshape(-1, 3)
     hand_pose = np.asarray(hand_pose, dtype=np.float32).reshape(len(global_orient), 45)
     transl = np.asarray(transl, dtype=np.float32).reshape(len(global_orient), 3)
+    global_orient, hand_pose, transl = mano_arrays_internal_to_native(
+        global_orient,
+        hand_pose,
+        transl,
+        is_right=is_right,
+    )
     betas = np.asarray(betas, dtype=np.float32)
     if betas.ndim == 1:
         betas = np.tile(betas[None], (len(global_orient), 1))
@@ -836,6 +909,7 @@ def payload_from_model(base_payload: dict[str, Any], model: Any) -> dict[str, An
             betas[b],
             trans[b],
             pred_valid,
+            is_right=side == "right_hand",
         )
     payload["slam_data"] = _export_slam_data(
         base_payload["slam_data"],
@@ -854,7 +928,7 @@ def res_dict_from_payload(payload: dict[str, Any]) -> dict[str, torch.Tensor]:
     is_right = []
     for handed in (0, 1):
         side = "right_hand" if handed == 1 else "left_hand"
-        mano = payload[side]["mano_params"]
+        mano = mano_params_native_to_internal(payload[side]["mano_params"], is_right=handed == 1)
         root_orient.append(np.asarray(mano["global_orient"], dtype=np.float32))
         pose_body.append(np.asarray(mano["hand_pose"], dtype=np.float32))
         trans.append(np.asarray(mano["transl"], dtype=np.float32))
@@ -903,6 +977,7 @@ def payload_from_prior_result(
             result["betas"][b],
             result["trans"][b],
             pred_valid,
+            is_right=side == "right_hand",
         )
     payload["slam_data"] = _export_slam_data(source_slam, scale=_slam_scale_value(source_slam))
     return payload
@@ -977,96 +1052,6 @@ def prepare_cfg(cfg: DictConfig) -> DictConfig:
     cfg.paths.base_dir = str(_REPO_ROOT.resolve())
     cfg = resolve_cfg_paths(cfg)
     return cfg
-<<<<<<< HEAD
-
-
-def snapshot_work_dir_config(cfg: DictConfig, work_dir: Path) -> None:
-    if not bool(cfg.get("snapshot_config", True)):
-        return
-    hydra_dir = work_dir / ".hydra"
-    hydra_dir.mkdir(parents=True, exist_ok=True)
-    OmegaConf.save(cfg, hydra_dir / "config.yaml")
-    for name in ("overrides.yaml", "hydra.yaml"):
-        src = Path.cwd() / ".hydra" / name
-        if src.is_file():
-            shutil.copy2(src, hydra_dir / name)
-    Logger.log(f"Saved config snapshot to {hydra_dir}")
-
-
-def collect_prior_loss_plots(prior_dir: Path, cfg: DictConfig) -> None:
-    if not bool(cfg.data.save_loss_plots):
-        return
-    summary_candidates = sorted(prior_dir.rglob("all_stages_loss.jpg"))
-    if summary_candidates:
-        dst = prior_dir / "all_stages_loss.jpg"
-        src = summary_candidates[-1]
-        if src.resolve() != dst.resolve():
-            shutil.copy2(src, dst)
-        Logger.log(f"Collected prior loss summary to {dst}")
-    else:
-        Logger.log(f"WARNING: no all_stages_loss.jpg found under {prior_dir}")
-
-    for src in sorted(prior_dir.rglob("stage_*_loss.jpg")):
-        if src.parent.resolve() == prior_dir.resolve():
-            continue
-        rel = src.relative_to(prior_dir)
-        dst = prior_dir / "_".join(rel.parts)
-        if dst.resolve() == src.resolve() or dst.is_file():
-            continue
-        shutil.copy2(src, dst)
-        Logger.log(f"Collected prior stage loss plot to {dst}")
-
-
-def has_image_frames(path: Path) -> bool:
-    return path.is_dir() and any(path.glob("*.jpg")) or path.is_dir() and any(path.glob("*.png"))
-
-
-def read_video_fps(path: Path) -> float:
-    try:
-        import cv2
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError("OpenCV is required to read video FPS when frame_opts.fps=auto") from exc
-    capture = cv2.VideoCapture(str(path))
-    try:
-        fps = float(capture.get(cv2.CAP_PROP_FPS))
-    finally:
-        capture.release()
-    if not np.isfinite(fps) or fps <= 0:
-        raise RuntimeError(f"Could not read a valid FPS from {path}")
-    return fps
-
-
-def ensure_keypoint_frames(cfg: DictConfig) -> None:
-    if not bool(cfg.data.get("extract_keypoints", False)):
-        return
-    keypoints_path = resolve_path(cfg.data.keypoints_npy)
-    if keypoints_path.is_file() and bool(cfg.data.get("reuse_keypoints_npy", True)):
-        return
-
-    image_root = resolve_path(cfg.data.image_root)
-    if image_root is None:
-        raise ValueError("data.image_root is required when extracting keypoints")
-    if has_image_frames(image_root):
-        return
-
-    src_path = resolve_path(cfg.data.get("src_path", None))
-    if src_path is None or not src_path.is_file():
-        raise FileNotFoundError(f"Cannot extract frames; data.src_path is not a file: {src_path}")
-
-    frame_opts = OmegaConf.to_container(cfg.data.get("frame_opts", {}), resolve=True)
-    frame_opts = dict(frame_opts) if frame_opts is not None else {}
-    fps = frame_opts.get("fps", 30)
-    if fps is None or str(fps).lower() == "auto":
-        fps = read_video_fps(src_path)
-        frame_opts["fps"] = fps
-
-    image_root.mkdir(parents=True, exist_ok=True)
-    print(f"Extracting keypoint frames from {src_path} to {image_root} at {fps} fps")
-    out = video_to_frames(src_path, image_root, **frame_opts)
-    if out != 0:
-        raise RuntimeError(f"Failed to extract frames from {src_path} to {image_root}")
-=======
->>>>>>> af015a6 (Refactor pose3d_hand processing and enhance camera trajectory functions)
 
 
 def snapshot_work_dir_config(cfg: DictConfig, work_dir: Path) -> None:
