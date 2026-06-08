@@ -154,3 +154,6 @@ dmypy.json
 
 # Local temp / conversion artifacts
 .tmp/
+
+# Demo outputs / local artifacts
+demo/
