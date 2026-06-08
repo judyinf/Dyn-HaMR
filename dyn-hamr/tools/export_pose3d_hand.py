@@ -193,15 +193,14 @@ def _convert_mano_params_for_output(
     if mano_output_convention != "manopth-lr":
         raise ValueError(f"Unsupported MANO output convention: {mano_output_convention}")
 
-    # run_visualize_pose3d.py uses native MANO_LEFT/MANO_RIGHT manopth layers,
-    # then divides the layer output by 1000. Keep rotations in radians and
-    # provide translation in millimeters to preserve meter-scale output.
+    # Native .pose3d_hand samples keep both MANO translation and camera traj
+    # translation in meters. Only convert left-hand rotations/transl handedness.
     if not is_right:
         global_orient = _mirror_axis_angle_x(global_orient)
         hand_pose = _mirror_axis_angle_x(hand_pose.reshape(-1, 3)).reshape(hand_pose.shape)
         transl = transl.copy()
         transl[:, 0] *= -1.0
-    return global_orient, hand_pose, transl * np.float32(1000.0)
+    return global_orient, hand_pose, transl
 
 
 def _empty_hand(seq_len: int) -> dict:
