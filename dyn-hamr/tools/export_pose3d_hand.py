@@ -92,45 +92,6 @@ def _as_float_scalar(value: np.ndarray | float | int) -> float:
     return float(arr[0])
 
 
-def _pred_valid_from_vis_mask(vis_mask: np.ndarray, seq_len: int) -> np.ndarray:
-    raw = np.asarray(vis_mask).reshape(-1)
-    if raw.dtype == np.bool_:
-        mask = raw.astype(bool)
-        if mask.shape[0] > seq_len:
-            mask = mask[:seq_len]
-        elif mask.shape[0] < seq_len:
-            padded = np.zeros(seq_len, dtype=bool)
-            padded[: mask.shape[0]] = mask
-            mask = padded
-        return mask
-
-    mask = raw.astype(np.float32)
-    seq_start, seq_end = 0, seq_len
-    if mask.shape[0] > seq_len:
-        # track_info vis_mask covers the optimized subsequence interval
-        mask = mask[:seq_len]
-    elif mask.shape[0] < seq_len:
-        padded = np.full(seq_len, -1, dtype=np.float32)
-        padded[: mask.shape[0]] = mask
-        mask = padded
-    return (mask >= 0).astype(bool)
-
-
-def _vis_mask_for_timeline(vis_mask: np.ndarray, timeline: Timeline) -> np.ndarray:
-    mask = np.asarray(vis_mask).reshape(-1)
-    is_bool = mask.dtype == np.bool_
-    if mask.shape[0] >= timeline.data_end:
-        mask = mask[timeline.data_start : timeline.data_end]
-    elif mask.shape[0] > timeline.full_len:
-        mask = mask[: timeline.full_len]
-    elif mask.shape[0] < timeline.full_len:
-        fill_value = False if is_bool else -1
-        padded = np.full(timeline.full_len, fill_value, dtype=mask.dtype)
-        padded[: mask.shape[0]] = mask
-        mask = padded
-    return mask
-
-
 def _betas_per_frame(betas: np.ndarray, seq_len: int) -> np.ndarray:
     betas = np.asarray(betas, dtype=np.float32)
     if betas.ndim == 1:
@@ -499,8 +460,6 @@ def _optional_scalar(
 
 def build_pose3d_hand(
     data: dict[str, np.ndarray],
-    track_vis_masks: dict[int, np.ndarray] | None,
-    track_ids: list[int] | None,
     fps: float,
     prefer_track_index: int | None,
     max_slam_keyframes: int,
@@ -554,19 +513,7 @@ def build_pose3d_hand(
         is_right = bool(
             np.round(float(np.asarray(_as_batch_array(data["is_right"])[b]).reshape(-1)[0]))
         )
-
-        if track_vis_masks is not None and track_ids is not None:
-            tid = int(track_ids[b]) if b < len(track_ids) else sorted(track_vis_masks)[b]
-            vis = track_vis_masks.get(tid)
-            if vis is None:
-                raise KeyError(f"track_info has no vis_mask for track id {tid}")
-            if timeline is not None:
-                vis = _vis_mask_for_timeline(vis, timeline)[
-                    timeline.insert_start : timeline.insert_end
-                ]
-            pred_valid = _pred_valid_from_vis_mask(vis, seq_len)
-        else:
-            pred_valid = np.ones(seq_len, dtype=bool)
+        pred_valid = np.ones(seq_len, dtype=bool)
 
         slot = build_hand_slot(
             _as_batch_array(data["root_orient"])[b],
@@ -655,19 +602,13 @@ def export_pose3d_hand(
     if missing:
         raise ValueError(f"{npz_path} missing keys: {sorted(missing)}")
 
-    track_vis_masks = None
-    track_ids_list = None
     timeline = None
     track_info_path = log_dir / "track_info.json"
     if track_info_path.is_file():
-        tids, vis_masks, data_interval, seq_interval = load_track_info(str(track_info_path))
+        _, _, data_interval, seq_interval = load_track_info(str(track_info_path))
         data_start, data_end = map(int, data_interval)
         seq_start, seq_end = map(int, seq_interval)
         timeline = Timeline((data_start, data_end), (seq_start, seq_end))
-        track_ids_list = [int(t) for t in tids.tolist()]
-        track_vis_masks = {}
-        for tid, mask in zip(track_ids_list, vis_masks.tolist()):
-            track_vis_masks[tid] = np.asarray(mask)
 
     vipe_camera = None
     if vipe_dir is not None:
@@ -676,8 +617,6 @@ def export_pose3d_hand(
 
     payload = build_pose3d_hand(
         data,
-        track_vis_masks,
-        track_ids_list,
         fps=fps,
         prefer_track_index=prefer_track_index,
         max_slam_keyframes=max_slam_keyframes,
@@ -814,3 +753,11 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+# python dyn-hamr/tools/export_pose3d_hand.py \
+#   --log-dir outputs/logs/video-custom/segment_000_ch1_undistort/segment_000_ch1_undistort-all-shot-0-0--1 \
+#   --phase prior \
+#   --result outputs/logs/video-custom/segment_000_ch1_undistort/segment_000_ch1_undistort-all-shot-0-0--1/prior/segment_000_ch1_undistort_000000_world_results.npz \
+#   --output demo/segment_000_ch1_undistort_prior.pose3d_hand \
+#   --mano-output-convention manopth-lr \
+#   --fps 29
