@@ -19,6 +19,9 @@ from HMP.rotations import axis_angle_to_matrix, matrix_to_axis_angle, matrix_to_
 from optim.output import load_track_info
 
 
+MANO_OUTPUT_CONVENTIONS = ("dynhamr", "manopth-lr")
+
+
 class Timeline:
     def __init__(
         self,
@@ -169,6 +172,38 @@ def _compute_relative_motion(
     }
 
 
+def _mirror_axis_angle_x(axis_angle: np.ndarray) -> np.ndarray:
+    """Mirror rotations through the x axis: R_left = M @ R_right @ M."""
+    axis_angle_t = torch.from_numpy(np.asarray(axis_angle, dtype=np.float32).reshape(-1, 3))
+    rot = axis_angle_to_matrix(axis_angle_t)
+    mirror = torch.diag(torch.tensor([-1.0, 1.0, 1.0], dtype=torch.float32))
+    mirrored = mirror.unsqueeze(0) @ rot @ mirror.unsqueeze(0)
+    return matrix_to_axis_angle(mirrored).reshape(np.asarray(axis_angle).shape).numpy().astype(np.float32)
+
+
+def _convert_mano_params_for_output(
+    global_orient: np.ndarray,
+    hand_pose: np.ndarray,
+    transl: np.ndarray,
+    is_right: bool,
+    mano_output_convention: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if mano_output_convention == "dynhamr":
+        return global_orient, hand_pose, transl
+    if mano_output_convention != "manopth-lr":
+        raise ValueError(f"Unsupported MANO output convention: {mano_output_convention}")
+
+    # run_visualize_pose3d.py uses native MANO_LEFT/MANO_RIGHT manopth layers,
+    # then divides the layer output by 1000. Keep rotations in radians and
+    # provide translation in millimeters to preserve meter-scale output.
+    if not is_right:
+        global_orient = _mirror_axis_angle_x(global_orient)
+        hand_pose = _mirror_axis_angle_x(hand_pose.reshape(-1, 3)).reshape(hand_pose.shape)
+        transl = transl.copy()
+        transl[:, 0] *= -1.0
+    return global_orient, hand_pose, transl * np.float32(1000.0)
+
+
 def _empty_hand(seq_len: int) -> dict:
     pred_valid = np.zeros(seq_len, dtype=bool)
     return {
@@ -197,11 +232,20 @@ def build_hand_slot(
     trans: np.ndarray,
     betas: np.ndarray,
     pred_valid: np.ndarray,
+    is_right: bool,
+    mano_output_convention: str,
 ) -> dict:
     T = trans.shape[0]
     global_orient = np.asarray(root_orient, dtype=np.float32).reshape(T, 3)
     hand_pose = np.asarray(pose_body, dtype=np.float32).reshape(T, 45)
     transl = np.asarray(trans, dtype=np.float32).reshape(T, 3)
+    global_orient, hand_pose, transl = _convert_mano_params_for_output(
+        global_orient,
+        hand_pose,
+        transl,
+        is_right=is_right,
+        mano_output_convention=mano_output_convention,
+    )
     betas_arr = _betas_per_frame(betas, T)
     pred_valid_arr = np.asarray(pred_valid, dtype=bool)
 
@@ -466,7 +510,11 @@ def build_pose3d_hand(
     timeline: Timeline | None,
     vipe_camera: dict[str, np.ndarray] | None,
     use_vipe_intrinsics: bool,
+    mano_output_convention: str,
 ) -> dict:
+    if mano_output_convention not in MANO_OUTPUT_CONVENTIONS:
+        raise ValueError(f"Unsupported MANO output convention: {mano_output_convention}")
+
     trans = _as_batch_array(data["trans"])
     B, seq_len = trans.shape[0], trans.shape[1]
     if timeline is not None and timeline.seq_len != seq_len:
@@ -527,6 +575,8 @@ def build_pose3d_hand(
             _as_batch_array(data["trans"])[b],
             _as_batch_array(data["betas"])[b],
             pred_valid,
+            is_right=is_right,
+            mano_output_convention=mano_output_convention,
         )
         if timeline is not None:
             slot = _insert_hand_slot(_empty_hand(out_len), slot, timeline)
@@ -568,6 +618,7 @@ def build_pose3d_hand(
         "left_hand": left_hand,
         "right_hand": right_hand,
         "slam_data": slam_data,
+        "mano_output_convention": mano_output_convention,
     }
 
 
@@ -584,6 +635,7 @@ def export_pose3d_hand(
     seq_name: str | None,
     use_vipe_intrinsics: bool,
     result_path: Path | None = None,
+    mano_output_convention: str = "dynhamr",
 ) -> Path:
     npz_path = result_path or find_latest_result(log_dir, phase)
     if npz_path is None:
@@ -635,6 +687,7 @@ def export_pose3d_hand(
         timeline=timeline,
         vipe_camera=vipe_camera,
         use_vipe_intrinsics=use_vipe_intrinsics,
+        mano_output_convention=mano_output_convention,
     )
 
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -718,6 +771,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use VIPE intrinsics for slam_data.img_focal/img_center when --vipe-dir is set",
     )
+    parser.add_argument(
+        "--mano-output-convention",
+        choices=MANO_OUTPUT_CONVENTIONS,
+        default="dynhamr",
+        help=(
+            "MANO parameter convention to write. dynhamr keeps the optimizer's "
+            "right-hand-model plus left x-flip convention. manopth-lr writes "
+            "native left/right MANO parameters for run_visualize_pose3d.py."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -742,6 +805,7 @@ def main() -> int:
             seq_name=args.seq_name,
             use_vipe_intrinsics=args.use_vipe_intrinsics,
             result_path=args.result.expanduser().resolve() if args.result else None,
+            mano_output_convention=args.mano_output_convention,
         )
     except (FileNotFoundError, ValueError, KeyError) as exc:
         print(f"error: {exc}", file=sys.stderr)
