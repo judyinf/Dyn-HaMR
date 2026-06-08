@@ -267,25 +267,46 @@ def _camera_track_array(
         ) from exc
 
 
-def _camera_traj_from_arrays(cam_t_arr: np.ndarray, cam_R_arr: np.ndarray) -> np.ndarray:
-    cam_t = torch.from_numpy(np.asarray(cam_t_arr, dtype=np.float32).reshape(-1, 3))
-    cam_R = torch.from_numpy(np.asarray(cam_R_arr, dtype=np.float32).reshape(-1, 3, 3))
-    quat_wxyz = matrix_to_quaternion(cam_R)
+def _camera_traj_c2w_from_arrays(center_world_arr: np.ndarray, R_c2w_arr: np.ndarray) -> np.ndarray:
+    center_world = torch.from_numpy(np.asarray(center_world_arr, dtype=np.float32).reshape(-1, 3))
+    R_c2w = torch.from_numpy(np.asarray(R_c2w_arr, dtype=np.float32).reshape(-1, 3, 3))
+    quat_wxyz = matrix_to_quaternion(R_c2w)
     quat_xyzw = torch.cat([quat_wxyz[..., 1:], quat_wxyz[..., :1]], dim=-1)
-    traj = torch.cat([cam_t, quat_xyzw], dim=-1).to(dtype=torch.float32)
+    traj = torch.cat([center_world, quat_xyzw], dim=-1).to(dtype=torch.float32)
     return traj.numpy()
 
 
-def _camera_traj(data: dict[str, np.ndarray], batch_idx: int, seq_len: int) -> np.ndarray:
+def _camera_center_from_w2c(
+    cam_t_scaled_arr: np.ndarray,
+    R_w2c_arr: np.ndarray,
+    world_scale: float,
+) -> np.ndarray:
+    if world_scale == 0.0:
+        raise ValueError("world_scale must be non-zero to recover camera centers")
+    cam_t_w2c = np.asarray(cam_t_scaled_arr, dtype=np.float32).reshape(-1, 3) / np.float32(world_scale)
+    R_w2c = np.asarray(R_w2c_arr, dtype=np.float32).reshape(-1, 3, 3)
+    R_c2w = np.swapaxes(R_w2c, -1, -2)
+    return -np.einsum("tij,tj->ti", R_c2w, cam_t_w2c).astype(np.float32)
+
+
+def _camera_traj(
+    data: dict[str, np.ndarray],
+    batch_idx: int,
+    seq_len: int,
+    world_scale: float,
+) -> np.ndarray:
     cam_t = _camera_track_array(data["cam_t"], batch_idx, seq_len, (3,))
-    cam_R = _camera_track_array(data["cam_R"], batch_idx, seq_len, (3, 3))
-    return _camera_traj_from_arrays(cam_t, cam_R)
+    R_w2c = _camera_track_array(data["cam_R"], batch_idx, seq_len, (3, 3))
+    R_c2w = np.swapaxes(R_w2c, -1, -2)
+    center_world = _camera_center_from_w2c(cam_t, R_w2c, world_scale)
+    return _camera_traj_c2w_from_arrays(center_world, R_c2w)
 
 
 def _camera_traj_for_timeline(
     data: dict[str, np.ndarray],
     batch_idx: int,
     timeline: Timeline,
+    world_scale: float,
 ) -> np.ndarray:
     cam_t_arr = np.asarray(data["cam_t"], dtype=np.float32)
     cam_R_arr = np.asarray(data["cam_R"], dtype=np.float32)
@@ -293,7 +314,7 @@ def _camera_traj_for_timeline(
     full_shape_r = (timeline.full_len, 3, 3)
     if cam_t_arr.shape == full_shape_t and cam_R_arr.shape == full_shape_r:
         cam_t = cam_t_arr
-        cam_R = cam_R_arr
+        R_w2c = cam_R_arr
     elif (
         cam_t_arr.ndim >= 2
         and cam_R_arr.ndim >= 3
@@ -301,15 +322,17 @@ def _camera_traj_for_timeline(
         and cam_R_arr.shape[-3:] == full_shape_r
     ):
         cam_t = cam_t_arr.reshape(-1, timeline.full_len, 3)[batch_idx]
-        cam_R = cam_R_arr.reshape(-1, timeline.full_len, 3, 3)[batch_idx]
+        R_w2c = cam_R_arr.reshape(-1, timeline.full_len, 3, 3)[batch_idx]
     else:
         cam_t = np.zeros(full_shape_t, dtype=np.float32)
-        cam_R = np.eye(3, dtype=np.float32)[None].repeat(timeline.full_len, axis=0)
+        R_w2c = np.eye(3, dtype=np.float32)[None].repeat(timeline.full_len, axis=0)
         seq_cam_t = _camera_track_array(data["cam_t"], batch_idx, timeline.seq_len, (3,))
-        seq_cam_R = _camera_track_array(data["cam_R"], batch_idx, timeline.seq_len, (3, 3))
+        seq_R_w2c = _camera_track_array(data["cam_R"], batch_idx, timeline.seq_len, (3, 3))
         cam_t[timeline.insert_start : timeline.insert_end] = seq_cam_t
-        cam_R[timeline.insert_start : timeline.insert_end] = seq_cam_R
-    return _camera_traj_from_arrays(cam_t, cam_R)
+        R_w2c[timeline.insert_start : timeline.insert_end] = seq_R_w2c
+    center_world = _camera_center_from_w2c(cam_t, R_w2c, world_scale)
+    R_c2w = np.swapaxes(R_w2c, -1, -2)
+    return _camera_traj_c2w_from_arrays(center_world, R_c2w)
 
 
 def _infer_seq_name(result_path: Path, output: Path) -> str:
@@ -376,7 +399,7 @@ def load_vipe_pose3d_camera(
 
     c2w_sel = c2w[selected]
     intrins_sel = intrins[selected, :4]
-    traj = _camera_traj_from_arrays(c2w_sel[:, :3, 3], c2w_sel[:, :3, :3])
+    traj = _camera_traj_c2w_from_arrays(c2w_sel[:, :3, 3], c2w_sel[:, :3, :3])
     focal = float((intrins_sel[0, 0] + intrins_sel[0, 1]) / 2.0)
     center = intrins_sel[0, 2:4].astype(np.float64)
     return {
@@ -525,9 +548,9 @@ def build_pose3d_hand(
             center = np.asarray(vipe_camera["img_center"], dtype=np.float64)
     else:
         traj = (
-            _camera_traj_for_timeline(data, traj_batch, timeline)
+            _camera_traj_for_timeline(data, traj_batch, timeline, scale_value)
             if timeline is not None
-            else _camera_traj(data, traj_batch, seq_len)
+            else _camera_traj(data, traj_batch, seq_len, scale_value)
         )
     slam_data = {
         "tstamp": _slam_tstamp(out_len, max_slam_keyframes),
