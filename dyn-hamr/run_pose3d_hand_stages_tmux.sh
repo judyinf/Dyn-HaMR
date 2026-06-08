@@ -8,13 +8,20 @@ CONDA_ENV="${CONDA_ENV:-dynhamr}"
 SEQ="${SEQ:-segment_000_ch1_undistort}"
 STAGE="${STAGE:-all}"
 
-POSE3D_HAND="${POSE3D_HAND:-../demo/${SEQ}.pose3d_hand}"
-TRACK_INFO="${TRACK_INFO:-../demo/${SEQ}_track_info.npy}"
+POSE3D_HAND="${POSE3D_HAND:-../demo/${SEQ}.compat.pose3d_hand}"
+TRACK_INFO="${TRACK_INFO:-../demo/${SEQ}_track_info.compat.npy}"
 KEYPOINTS_NPY="${KEYPOINTS_NPY:-../demo/${SEQ}_keypoints.npy}"
-WORK_DIR="${WORK_DIR:-../outputs/pose3d_hand_stages/${SEQ}}"
+IMAGE_ROOT="${IMAGE_ROOT:-../demo/${SEQ}_frames}"
+VITPOSE_CONFIG="${VITPOSE_CONFIG:-../third-party/hamer/third-party/ViTPose/configs/wholebody/2d_kpt_sview_rgb_img/topdown_heatmap/coco-wholebody/ViTPose_huge_wholebody_256x192.py}"
+VITPOSE_CHECKPOINT="${VITPOSE_CHECKPOINT:-../_DATA/vitpose_ckpts/vitpose+_huge/wholebody.pth}"
+EXTRACT_KEYPOINTS="${EXTRACT_KEYPOINTS:-true}"
+DEVICE_OVERRIDE="${DEVICE_OVERRIDE:-}"
+WORK_DIR="${WORK_DIR:-../outputs/pose3d_hand_stages_2/${SEQ}}"
 OUTPUT="${OUTPUT:-../demo/${SEQ}_export.pose3d_hand}"
 LOG_FILE="${LOG_FILE:-${WORK_DIR}/run_${STAGE}_$(date +%Y%m%d_%H%M%S).log}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+RESUME="${RESUME:-True}"
+SAVE_LOSS_PLOTS="${SAVE_LOSS_PLOTS:-true}"
 
 if [[ "${LOG_FILE}" = /* ]]; then
   LOG_PATH="${LOG_FILE}"
@@ -56,9 +63,19 @@ runner_cmd=(
   "data.pose3d_hand=${POSE3D_HAND}"
   "data.track_info=${TRACK_INFO}"
   "data.keypoints_npy=${KEYPOINTS_NPY}"
+  "data.extract_keypoints=${EXTRACT_KEYPOINTS}"
+  "data.image_root=${IMAGE_ROOT}"
+  "data.vitpose_config=${VITPOSE_CONFIG}"
+  "data.vitpose_checkpoint=${VITPOSE_CHECKPOINT}"
   "data.work_dir=${WORK_DIR}"
   "data.output=${OUTPUT}"
+  "data.resume=${RESUME}"
+  "data.save_loss_plots=${SAVE_LOSS_PLOTS}"
 )
+
+if [[ -n "${DEVICE_OVERRIDE}" ]]; then
+  runner_cmd+=("data.device_override=${DEVICE_OVERRIDE}")
+fi
 
 runner_cmd_str="$(printf "%q " "${runner_cmd[@]}")"
 if [[ -n "${EXTRA_ARGS}" ]]; then
@@ -96,4 +113,7 @@ echo "终止运行:"
 echo "  tmux kill-session -t ${SESSION_NAME}"
 echo
 echo "示例覆盖参数:"
+echo "  bash dyn-hamr/run_pose3d_hand_stages_tmux.sh"
 echo "  STAGE=root EXTRA_ARGS='optim.root.num_iters=0' bash dyn-hamr/run_pose3d_hand_stages_tmux.sh"
+echo "  DEVICE_OVERRIDE=cuda:1 bash dyn-hamr/run_pose3d_hand_stages_tmux.sh"
+echo "  DEVICE_OVERRIDE=cpu STAGE=root EXTRA_ARGS='optim.root.num_iters=0' bash dyn-hamr/run_pose3d_hand_stages_tmux.sh"

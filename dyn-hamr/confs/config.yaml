@@ -5,6 +5,7 @@ defaults:
 
 model:
   use_init: True
+  use_vposer: False
   opt_cams: False #True
   opt_scale: True
   async_tracks: True
@@ -40,13 +41,13 @@ MANO:
 
 paths:
   base_dir: None
-  DATA_DIR: _DATA/data/
+  DATA_DIR: _DATA/data
   vposer: VPoser/pretrained/Vposer_right_mirrored # _DATA/body_models/vposer_v1_0
 
 HMP:
   config: hmp_config.yaml
   use_hposer: False
-  vid_path: ${data.root}/video/${data.seq}.mp4
+  vid_path: ${data.sources.images}
   exp_name: None
 
 fps: 30

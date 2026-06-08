@@ -1,6 +1,7 @@
 import argparse
 import imageio
 import os
+import shutil
 import subprocess
 
 
@@ -72,6 +73,7 @@ def video_to_frames(
     start_sec=0,
     end_sec=-1,
     overwrite=False,
+    start_number=None,
     **kwargs,
 ):
     """
@@ -80,6 +82,40 @@ def video_to_frames(
     :param fps
     :param down_scale (optional int)
     """
+    def _video_to_frames_cv2():
+        import cv2
+
+        capture = cv2.VideoCapture(path)
+        if not capture.isOpened():
+            raise ValueError(f"Could not open video: {path}")
+        source_fps = float(capture.get(cv2.CAP_PROP_FPS))
+        if source_fps <= 0:
+            source_fps = float(fps)
+        step = max(int(round(source_fps / float(fps))), 1)
+        start_frame = max(int(round(float(start_sec) * source_fps)), 0)
+        end_frame = None if end_sec <= start_sec else int(round(float(end_sec) * source_fps))
+        capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        frame_idx = start_frame
+        written = int(start_number or 0)
+        os.makedirs(out_dir, exist_ok=True)
+        while True:
+            ok, frame = capture.read()
+            if not ok or (end_frame is not None and frame_idx >= end_frame):
+                break
+            if (frame_idx - start_frame) % step == 0:
+                if down_scale != 1:
+                    frame = cv2.resize(
+                        frame,
+                        (frame.shape[1] // int(down_scale), frame.shape[0] // int(down_scale)),
+                    )
+                out_path = os.path.join(out_dir, f"{written:06d}.{ext}")
+                if overwrite or not os.path.exists(out_path):
+                    cv2.imencode(f".{ext}", frame)[1].tofile(out_path)
+                written += 1
+            frame_idx += 1
+        capture.release()
+        return 0
+
     path = str(path)
     base_name = path.replace('.mp4', '').replace('.MP4', '').replace('.avi', '')
     print(path, base_name)
@@ -87,18 +123,24 @@ def video_to_frames(
 
     if os.path.isfile(path):
         os.makedirs(out_dir, exist_ok=True)
+        if shutil.which("ffmpeg") is None:
+            print("ffmpeg not found; falling back to OpenCV frame extraction")
+            return _video_to_frames_cv2()
 
-        arg_str = f"-copyts -qscale:v 2 -vf fps={fps}"
+        vf = f"fps={fps}"
         if down_scale != 1:
-            arg_str = f"{arg_str},scale='iw/{down_scale}:ih/{down_scale}'"
-        if start_sec > 0:
-            arg_str = f"{arg_str} -ss {start_sec}"
-        if end_sec > start_sec:
-            arg_str = f"{arg_str} -to {end_sec}"
+            vf = f"{vf},scale=iw/{down_scale}:ih/{down_scale}"
 
-        yn = "-y" if overwrite else "-n"
-        cmd = f"ffmpeg -i {path} {arg_str} {out_dir}/%06d.{ext} {yn}"
-        print(cmd)
+        cmd = ["ffmpeg", "-i", path, "-copyts", "-qscale:v", "2", "-vf", vf]
+        if start_sec > 0:
+            cmd.extend(["-ss", str(start_sec)])
+        if end_sec > start_sec:
+            cmd.extend(["-to", str(end_sec)])
+        if start_number is not None:
+            cmd.extend(["-start_number", str(start_number)])
+
+        cmd.extend([f"{out_dir}/%06d.{ext}", "-y" if overwrite else "-n"])
+        print(" ".join(cmd))
     elif os.path.isdir(base_name):
         os.system(f"cp -r {base_name} {out_dir}")
         return 0
@@ -106,7 +148,7 @@ def video_to_frames(
         print(path, os.path.exists(path))
         raise ValueError
 
-    return subprocess.call(cmd, shell=True, stdin=subprocess.PIPE)
+    return subprocess.call(cmd, stdin=subprocess.PIPE)
 
 # def video_to_frames(
 #     path,
@@ -183,6 +225,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-y", "--overwrite", action="store_true", help="overwrite if already exist"
     )
+    parser.add_argument(
+        "--start_number", type=int, default=None, help="first output frame number"
+    )
     args = parser.parse_args()
     seqs_all = os.listdir(args.data_root)
     if args.seqs is None:
@@ -203,4 +248,5 @@ if __name__ == "__main__":
             args.start_sec,
             args.end_sec,
             args.overwrite,
+            start_number=args.start_number,
         )

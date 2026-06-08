@@ -775,9 +775,10 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
 
     config_type = os.path.splitext(os.path.basename(config_f))[0]
     args.raw_config = config_type in ["_pymafx_raw", "_metro_raw"]
-    abs_video_path = os.path.join(os.getcwd(), args.vid_path)
+    abs_video_path = os.path.abspath(os.path.join(os.getcwd(), args.vid_path))
+    if os.path.isfile(abs_video_path):
+        abs_video_path = os.path.dirname(abs_video_path)
 
-    args.dataname = args.vid_path.split("/")[3]
     args.N_frames = len(glob.glob(os.path.join(abs_video_path, "*.jpg")))
     if args.N_frames == 0:
         args.N_frames = len(glob.glob(os.path.join(abs_video_path, "*.png")))
@@ -862,6 +863,11 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
                 'betas': Be[0].detach().cpu().numpy(),
                 'decode_root': DR[0, :valid_len].detach().cpu().numpy(),
             }
+            loss_summary = os.path.join(args.pkl_output_dir, "all_stages_loss.jpg")
+            if os.path.isfile(loss_summary):
+                shutil.copy2(loss_summary, os.path.join(window_dir, "all_stages_loss.jpg"))
+            for loss_plot in glob.glob(os.path.join(args.pkl_output_dir, "stage_*_loss.jpg")):
+                shutil.copy2(loss_plot, os.path.join(window_dir, os.path.basename(loss_plot)))
             shutil.rmtree(args.pkl_output_dir)
             np.savez(os.path.join(window_dir, 'final.npz'), **window_result)
             hand_windows.append(window_result)
@@ -891,7 +897,7 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
     res_dict['decode_root'] = np.stack([hand['decode_root'] for hand in stitched_hands])
     pred_save_path = os.path.join(
         args.save_path,
-        os.path.basename(args.vid_path).split('.')[0] + '_000000_world_results.npz',
+        f"{args.dataname}_000000_world_results.npz",
     )
 
     for key in res_dict.keys():
@@ -1627,6 +1633,7 @@ def fitting_prior(obs_data, res_dict, hand_model, opt, data_args, out_dir, devic
     args.plot_loss = True
 
     args.vid_path = opt.HMP.vid_path
+    args.dataname = data_args.seq
 
     args.root = opt.paths.base_dir
     args.dataset_dir = os.path.join(opt.paths.base_dir, '_DATA/hmp_model')
@@ -1662,7 +1669,16 @@ def fitting_prior(obs_data, res_dict, hand_model, opt, data_args, out_dir, devic
     model.eval()
 
     fk = ForwardKinematicsLayer(args)
-    multi_stage_opt(opt, device, obs_data, res_dict, hand_model, os.path.join(os.path.dirname(__file__), opt.HMP.config), opt.HMP.exp_name, init_method)
+    return multi_stage_opt(
+        opt,
+        device,
+        obs_data,
+        res_dict,
+        hand_model,
+        os.path.join(os.path.dirname(__file__), opt.HMP.config),
+        opt.HMP.exp_name,
+        init_method,
+    )
 
 
 def run_prior(

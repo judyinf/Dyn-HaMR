@@ -105,10 +105,16 @@ class CameraParams(Params):
         self._cam_R = cam_R  # (T, 3, 3)
         self._cam_t = cam_t  # (T, 3)
 
-        world_scale = torch.ones(1, 1, device=device)
+        world_scale = torch.ones(1, 1, device=device, dtype=torch.float32)
+        if "world_scale" in kwargs:
+            world_scale = kwargs["world_scale"]
+            if not isinstance(world_scale, torch.Tensor):
+                world_scale = torch.tensor(
+                    [[float(world_scale)]], device=device, dtype=torch.float32
+                )
+            else:
+                world_scale = world_scale.to(device=device, dtype=torch.float32)
         if self.opt_scale:
-            if "world_scale" in kwargs:
-                world_scale = kwargs["world_scale"]
             self.set_param("world_scale", world_scale)
         else:
             self.world_scale = world_scale

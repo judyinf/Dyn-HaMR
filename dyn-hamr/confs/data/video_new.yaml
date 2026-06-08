@@ -1,23 +1,33 @@
 type: video
 split: custom
 root: ..
+video_dir: demo
 seq: segment_000_ch1_undistort
+ext: mp4
+src_path: ${data.root}/${data.video_dir}/${data.seq}.${data.ext}
 
 # Three-stage pose3d_hand runner options.
 stage: all
 work_dir: ../outputs/pose3d_hand_stages/${data.seq}
 output: ../demo/${data.seq}_export.pose3d_hand
-pose3d_hand: ../demo/${data.seq}.pose3d_hand
-track_info: ../demo/${data.seq}_track_info.npy
+pose3d_hand: ../demo/${data.seq}.compat.pose3d_hand
+track_info: ../demo/${data.seq}_track_info.compat.npy
 keypoints_npy: ../demo/${data.seq}_keypoints.npy
-extract_keypoints: false
-image_root: null
-vitpose_config: null
-vitpose_checkpoint: null
+extract_keypoints: true
+image_root: ../demo/${data.seq}_frames
+vitpose_config: ../third-party/hamer/third-party/ViTPose/configs/wholebody/2d_kpt_sview_rgb_img/topdown_heatmap/coco-wholebody/ViTPose_huge_wholebody_256x192.py
+vitpose_checkpoint: ../_DATA/vitpose_ckpts/vitpose+_huge/wholebody.pth
 reuse_keypoints_npy: true
-traj_convention: c2w
-resume: false
+resume: True
+save_loss_plots: true
 device_override: null
+frame_opts:
+  ext: jpg
+  fps: auto
+  start_sec: 0
+  end_sec: -1
+  overwrite: false
+  start_number: 0
 
 # Compatibility fields still used by shared config/loss/visualization code.
 use_cams: false
