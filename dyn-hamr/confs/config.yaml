@@ -49,6 +49,26 @@ HMP:
   use_hposer: False
   vid_path: ${data.sources.images}
   exp_name: None
+  parallel:
+    hand:
+      enabled: true
+      workers: 2
+      devices:
+        - cuda:0
+    window:
+      enabled: true
+      workers_per_hand: 4
+      devices:
+        - cuda:0
+
+runtime:
+  fps: auto
+  fps_tolerance: 0.5
+  profile:
+    enabled: true
+    output: ../outputs/logs/profile_${data.name}.json
+    print_summary: false
+    include_iteration_samples: false
 
 fps: 30
 log_root: ../outputs/logs

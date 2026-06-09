@@ -164,6 +164,28 @@ def _convert_mano_params_for_output(
     return global_orient, hand_pose, transl
 
 
+def mano_params_not_all_zero(
+    global_orient: np.ndarray,
+    hand_pose: np.ndarray,
+    betas: np.ndarray,
+    transl: np.ndarray,
+    *,
+    atol: float = 1e-8,
+) -> np.ndarray:
+    T = len(global_orient)
+    global_orient = np.asarray(global_orient, dtype=np.float32).reshape(T, -1)
+    hand_pose = np.asarray(hand_pose, dtype=np.float32).reshape(T, -1)
+    betas = np.asarray(betas, dtype=np.float32)
+    if betas.ndim == 1:
+        betas = np.tile(betas[None], (T, 1))
+    elif betas.ndim == 2 and betas.shape[0] == 1:
+        betas = np.tile(betas, (T, 1))
+    betas = betas.reshape(T, -1)
+    transl = np.asarray(transl, dtype=np.float32).reshape(T, -1)
+    params = np.concatenate([global_orient, hand_pose, betas, transl], axis=1)
+    return ~np.all(np.isclose(params, 0.0, atol=atol), axis=1)
+
+
 def _empty_hand(seq_len: int) -> dict:
     pred_valid = np.zeros(seq_len, dtype=bool)
     return {
@@ -208,6 +230,12 @@ def build_hand_slot(
     )
     betas_arr = _betas_per_frame(betas, T)
     pred_valid_arr = np.asarray(pred_valid, dtype=bool)
+    pred_valid_arr = pred_valid_arr & mano_params_not_all_zero(
+        global_orient,
+        hand_pose,
+        betas_arr,
+        transl,
+    )
 
     global_orient_t = torch.from_numpy(global_orient)
     transl_t = torch.from_numpy(transl)

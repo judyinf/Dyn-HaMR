@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import sys
+import time
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,6 +37,99 @@ from util.tensor import move_to
 
 STAGE_ORDER = ("root", "smooth", "prior")
 STAGE_DIR = {"root": "root_fit", "smooth": "smooth_fit", "prior": "prior"}
+
+
+class StageProfiler:
+    def __init__(self, enabled: bool = False, include_iteration_samples: bool = False) -> None:
+        self.enabled = enabled
+        self.include_iteration_samples = include_iteration_samples
+        self.data: dict[str, Any] = {"total_sec": 0.0, "stages": {}}
+
+    @staticmethod
+    def _sync(device: torch.device | None = None) -> None:
+        if device is not None and device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+    def _node(self, path: str | list[str]) -> dict[str, Any]:
+        parts = path.split(".") if isinstance(path, str) else path
+        node = self.data
+        if parts and parts[0] in STAGE_ORDER + ("keypoints",):
+            node = node.setdefault("stages", {})
+        for part in parts:
+            node = node.setdefault(part, {})
+        return node
+
+    @contextmanager
+    def section(
+        self,
+        path: str | list[str],
+        key: str = "total_sec",
+        *,
+        device: torch.device | None = None,
+        metadata: dict[str, Any] | None = None,
+    ):
+        if not self.enabled:
+            yield
+            return
+        self._sync(device)
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync(device)
+            elapsed = time.perf_counter() - start
+            node = self._node(path)
+            node[key] = float(node.get(key, 0.0) + elapsed)
+            if metadata:
+                node.setdefault("metadata", {}).update(metadata)
+
+    def record_value(self, path: str | list[str], key: str, value: Any) -> None:
+        if not self.enabled:
+            return
+        self._node(path)[key] = value
+
+    def record_iteration(self, path: str | list[str], seconds: float) -> None:
+        if not self.enabled:
+            return
+        node = self._node(path)
+        stats = node.setdefault(
+            "iterations",
+            {"count": 0, "total_sec": 0.0, "mean_sec": 0.0, "min_sec": None, "max_sec": None},
+        )
+        stats["count"] += 1
+        stats["total_sec"] += float(seconds)
+        stats["mean_sec"] = stats["total_sec"] / stats["count"]
+        stats["min_sec"] = float(seconds) if stats["min_sec"] is None else min(stats["min_sec"], float(seconds))
+        stats["max_sec"] = float(seconds) if stats["max_sec"] is None else max(stats["max_sec"], float(seconds))
+        if self.include_iteration_samples:
+            stats.setdefault("samples_sec", []).append(float(seconds))
+
+    def merge_prior_profile(self, prior_profile: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        self._node("prior").update(prior_profile)
+
+    def write_json(self, path: Path) -> None:
+        if not self.enabled:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def summary_lines(self) -> list[str]:
+        if not self.enabled:
+            return []
+        lines = [f"profile total_sec={self.data.get('total_sec', 0.0):.3f}"]
+        for name, stage in self.data.get("stages", {}).items():
+            total = stage.get("total_sec")
+            if total is None:
+                continue
+            line = f"profile {name}: total_sec={total:.3f}"
+            iters = stage.get("iterations")
+            if iters:
+                line += f" iterations={iters['count']} mean_sec={iters['mean_sec']:.4f}"
+            lines.append(line)
+        return lines
 
 
 def resolve_path(value: str | Path | None) -> Path | None:
@@ -189,6 +285,28 @@ def mano_arrays_internal_to_native(
     if not is_right:
         return _convert_left_mano_between_native_and_internal(global_orient, hand_pose, transl)
     return global_orient, hand_pose, transl
+
+
+def mano_params_not_all_zero(
+    global_orient: np.ndarray,
+    hand_pose: np.ndarray,
+    betas: np.ndarray,
+    transl: np.ndarray,
+    *,
+    atol: float = 1e-8,
+) -> np.ndarray:
+    T = len(global_orient)
+    global_orient = np.asarray(global_orient, dtype=np.float32).reshape(T, -1)
+    hand_pose = np.asarray(hand_pose, dtype=np.float32).reshape(T, -1)
+    betas = np.asarray(betas, dtype=np.float32)
+    if betas.ndim == 1:
+        betas = np.tile(betas[None], (T, 1))
+    elif betas.ndim == 2 and betas.shape[0] == 1:
+        betas = np.tile(betas, (T, 1))
+    betas = betas.reshape(T, -1)
+    transl = np.asarray(transl, dtype=np.float32).reshape(T, -1)
+    params = np.concatenate([global_orient, hand_pose, betas, transl], axis=1)
+    return ~np.all(np.isclose(params, 0.0, atol=atol), axis=1)
 
 
 def infer_seq_name(path: Path) -> str:
@@ -626,10 +744,16 @@ class Pose3DHandStageData:
     vitpose_checkpoint: Path | None = None
     vitpose_device: str = "cuda:0"
     frozen_init_latent_pose: torch.Tensor | None = None
+    runtime_fps: float | None = None
+    profiler: StageProfiler | None = None
 
     def __post_init__(self) -> None:
-        self.payload = load_pose3d_payload(self.pose_path)
-        self.track_info = load_track_info_npy(self.track_info_path)
+        with self.profiler.section("keypoints", "pose_payload_read_sec") if self.profiler else nullcontext():
+            self.payload = load_pose3d_payload(self.pose_path)
+        if self.runtime_fps is not None:
+            self.payload["fps"] = float(self.runtime_fps)
+        with self.profiler.section("keypoints", "track_info_read_sec") if self.profiler else nullcontext():
+            self.track_info = load_track_info_npy(self.track_info_path)
         self.T = len(self.payload["left_hand"]["pred_valid"])
         self.seq_interval = (0, self.T)
         self.track_ids = [0, 1]
@@ -642,6 +766,10 @@ class Pose3DHandStageData:
 
     def _load_or_create_keypoints(self) -> dict[int, dict[str, Any]]:
         if self.keypoints_npy.is_file():
+            if self.profiler:
+                self.profiler.record_value("keypoints", "cache_hit", True)
+                with self.profiler.section("keypoints", "cache_read_sec"):
+                    return load_keypoints_npy(self.keypoints_npy, self.T)
             return load_keypoints_npy(self.keypoints_npy, self.T)
         if not self.extract_keypoints:
             raise FileNotFoundError(
@@ -649,6 +777,22 @@ class Pose3DHandStageData:
             )
         if self.image_root is None or self.vitpose_config is None or self.vitpose_checkpoint is None:
             raise ValueError("image_root, vitpose_config, and vitpose_checkpoint are required to extract keypoints")
+        if self.profiler:
+            self.profiler.record_value("keypoints", "cache_hit", False)
+            with self.profiler.section("keypoints", "vitpose_sec"):
+                payload = extract_keypoints_from_track_info(
+                    self.track_info,
+                    self.T,
+                    self.seq_name,
+                    self.image_root,
+                    self.vitpose_config,
+                    self.vitpose_checkpoint,
+                    self.vitpose_device,
+                )
+            with self.profiler.section("keypoints", "cache_write_sec"):
+                save_keypoints_npy(self.keypoints_npy, payload)
+            with self.profiler.section("keypoints", "cache_read_sec"):
+                return load_keypoints_npy(self.keypoints_npy, self.T)
         payload = extract_keypoints_from_track_info(
             self.track_info,
             self.T,
@@ -824,6 +968,7 @@ def hand_slot_from_arrays(
     if betas.ndim == 1:
         betas = np.tile(betas[None], (len(global_orient), 1))
     pred_valid = np.asarray(pred_valid, dtype=bool).reshape(len(global_orient))
+    pred_valid = pred_valid & mano_params_not_all_zero(global_orient, hand_pose, betas, transl)
     return {
         "mano_params": {
             "global_orient": global_orient,
@@ -1027,6 +1172,7 @@ def make_stage_data(
     cfg: DictConfig,
     stage: str,
     frozen_init_latent_pose: torch.Tensor | None = None,
+    profiler: StageProfiler | None = None,
 ) -> Pose3DHandStageData:
     vitpose_device = cfg.data.get("device_override", None)
     if vitpose_device is None:
@@ -1042,6 +1188,8 @@ def make_stage_data(
         vitpose_checkpoint=resolve_path(cfg.data.vitpose_checkpoint),
         vitpose_device=str(vitpose_device),
         frozen_init_latent_pose=frozen_init_latent_pose,
+        runtime_fps=float(cfg.fps),
+        profiler=profiler,
     )
 
 
@@ -1110,17 +1258,84 @@ def read_video_fps(path: Path) -> float:
     return fps
 
 
-def ensure_keypoint_frames(cfg: DictConfig) -> None:
+def _is_auto_value(value: Any) -> bool:
+    return value is None or str(value).lower() == "auto"
+
+
+def _video_path_for_fps(cfg: DictConfig) -> Path | None:
+    for key in ("src_path", "video_path"):
+        value = cfg.data.get(key, None)
+        if value is None:
+            continue
+        path = resolve_path(value)
+        if path is not None and path.is_file():
+            return path
+    vid_path = cfg.HMP.get("vid_path", None)
+    if vid_path is not None:
+        path = resolve_path(vid_path)
+        if path is not None and path.is_file():
+            return path
+    return None
+
+
+def resolve_runtime_fps(cfg: DictConfig, pose_payload: dict[str, Any]) -> float:
+    runtime_cfg = cfg.get("runtime", {})
+    runtime_fps = runtime_cfg.get("fps", "auto")
+    if not _is_auto_value(runtime_fps):
+        raise ValueError("Only runtime.fps=auto is supported")
+
+    tolerance = float(runtime_cfg.get("fps_tolerance", 0.5))
+    pose_fps = pose_payload.get("fps", None)
+    pose_fps = float(pose_fps) if pose_fps is not None else None
+    video_path = _video_path_for_fps(cfg)
+    video_fps = read_video_fps(video_path) if video_path is not None else None
+
+    if video_fps is not None and pose_fps is not None:
+        diff = abs(video_fps - pose_fps)
+        if diff > tolerance:
+            raise ValueError(
+                f"FPS mismatch: video {video_fps:.6g} vs pose3d_hand {pose_fps:.6g} "
+                f"(tolerance {tolerance})"
+            )
+        resolved = video_fps
+        if diff > 1e-4:
+            print(
+                f"WARNING: video FPS {video_fps:.6g} differs from pose3d_hand FPS "
+                f"{pose_fps:.6g}; using video FPS"
+            )
+    elif video_fps is not None:
+        resolved = video_fps
+    elif pose_fps is not None:
+        resolved = pose_fps
+    else:
+        resolved = float(cfg.get("fps", 30.0))
+        print(f"WARNING: could not resolve FPS from video or pose3d_hand; using {resolved:.6g}")
+
+    cfg.fps = float(resolved)
+    if "runtime" in cfg:
+        cfg.runtime.resolved_fps = float(resolved)
+    if "data" in cfg and "frame_opts" in cfg.data and _is_auto_value(cfg.data.frame_opts.get("fps", None)):
+        cfg.data.frame_opts.fps = float(resolved)
+    return float(resolved)
+
+
+def ensure_keypoint_frames(cfg: DictConfig, profiler: StageProfiler | None = None) -> None:
     if not bool(cfg.data.get("extract_keypoints", False)):
+        if profiler:
+            profiler.record_value("keypoints", "frame_extraction_status", "disabled")
         return
     keypoints_path = resolve_path(cfg.data.keypoints_npy)
     if keypoints_path.is_file() and bool(cfg.data.get("reuse_keypoints_npy", True)):
+        if profiler:
+            profiler.record_value("keypoints", "frame_extraction_status", "keypoint_cache_hit")
         return
 
     image_root = resolve_path(cfg.data.image_root)
     if image_root is None:
         raise ValueError("data.image_root is required when extracting keypoints")
     if has_image_frames(image_root):
+        if profiler:
+            profiler.record_value("keypoints", "frame_extraction_status", "image_cache_hit")
         return
 
     src_path = resolve_path(cfg.data.get("src_path", None))
@@ -1130,13 +1345,16 @@ def ensure_keypoint_frames(cfg: DictConfig) -> None:
     frame_opts = OmegaConf.to_container(cfg.data.get("frame_opts", {}), resolve=True)
     frame_opts = dict(frame_opts) if frame_opts is not None else {}
     fps = frame_opts.get("fps", 30)
-    if fps is None or str(fps).lower() == "auto":
+    if _is_auto_value(fps):
         fps = read_video_fps(src_path)
         frame_opts["fps"] = fps
 
     image_root.mkdir(parents=True, exist_ok=True)
     print(f"Extracting keypoint frames from {src_path} to {image_root} at {fps} fps")
-    out = video_to_frames(src_path, image_root, **frame_opts)
+    if profiler:
+        profiler.record_value("keypoints", "frame_extraction_status", "extracted")
+    with profiler.section("keypoints", "frame_extraction_sec") if profiler else nullcontext():
+        out = video_to_frames(src_path, image_root, **frame_opts)
     if out != 0:
         raise RuntimeError(f"Failed to extract frames from {src_path} to {image_root}")
 
@@ -1157,74 +1375,126 @@ def run_root_or_smooth(
     device: torch.device,
     frozen_init_latent_pose: torch.Tensor | None = None,
     pose_prior: Any | None = None,
+    profiler: StageProfiler | None = None,
 ) -> Path:
     from optim.optimizers import RootOptimizer, SmoothOptimizer
 
-    data = make_stage_data(cfg, stage, frozen_init_latent_pose=frozen_init_latent_pose)
-    num_iters = int(cfg.optim.root.num_iters if stage == "root" else cfg.optim.smooth.num_iters)
-    output = stage_output_path(cfg, stage)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    if num_iters == 0:
-        Logger.log(f"Skipping {stage} optimization because num_iters=0")
-        return save_pose3d_payload(data.payload, output)
+    with profiler.section(stage, "total_sec", device=device) if profiler else nullcontext():
+        with profiler.section(stage, "io_sec") if profiler else nullcontext():
+            data = make_stage_data(
+                cfg,
+                stage,
+                frozen_init_latent_pose=frozen_init_latent_pose,
+                profiler=profiler,
+            )
+            output = stage_output_path(cfg, stage)
+            output.parent.mkdir(parents=True, exist_ok=True)
+        num_iters = int(cfg.optim.root.num_iters if stage == "root" else cfg.optim.smooth.num_iters)
+        if profiler:
+            profiler.record_value(stage, "num_iters", num_iters)
+            profiler.record_value(stage, "num_tracks", data.n_tracks)
+            profiler.record_value(stage, "num_frames", data.T)
+        if num_iters == 0:
+            Logger.log(f"Skipping {stage} optimization because num_iters=0")
+            with profiler.section(stage, "export_sec") if profiler else nullcontext():
+                return save_pose3d_payload(data.payload, output)
 
-    obs_data = move_to(data.obs_data(), device)
-    body_model = make_body_model(cfg, data.n_tracks * data.T, device)
-    model = make_model(cfg, body_model, data, device, pose_prior=pose_prior)
-    all_loss_weights = stage_loss_weights(cfg)
-    opt_kwargs = dict(cfg.optim.options)
-    optimizer_cls = RootOptimizer if stage == "root" else SmoothOptimizer
-    optimizer = optimizer_cls(model, all_loss_weights, **opt_kwargs)
-    Logger.log(f"Running {stage} for {num_iters} iterations")
-    for i in range(num_iters):
-        optimizer.cur_step = i
-        optimizer.loss.cur_step = i
-        optimizer.optim_step(obs_data, i)
-    optimizer.cur_step = num_iters
-    payload = payload_from_model(data.payload, model)
-    save_pose3d_payload(payload, output)
-    save_stage_loss_plots(optimizer, output.parent, cfg)
-    return output
+        with profiler.section(stage, "obs_build_sec", device=device) if profiler else nullcontext():
+            obs_data = move_to(data.obs_data(), device)
+        with profiler.section(stage, "body_model_init_sec", device=device) if profiler else nullcontext():
+            body_model = make_body_model(cfg, data.n_tracks * data.T, device)
+        with profiler.section(stage, "scene_model_init_sec", device=device) if profiler else nullcontext():
+            model = make_model(cfg, body_model, data, device, pose_prior=pose_prior)
+        all_loss_weights = stage_loss_weights(cfg)
+        opt_kwargs = dict(cfg.optim.options)
+        optimizer_cls = RootOptimizer if stage == "root" else SmoothOptimizer
+        with profiler.section(stage, "optimizer_init_sec", device=device) if profiler else nullcontext():
+            optimizer = optimizer_cls(model, all_loss_weights, **opt_kwargs)
+        Logger.log(f"Running {stage} for {num_iters} iterations")
+        with profiler.section(stage, "optimization_sec", device=device) if profiler else nullcontext():
+            for i in range(num_iters):
+                optimizer.cur_step = i
+                optimizer.loss.cur_step = i
+                StageProfiler._sync(device)
+                iter_start = time.perf_counter()
+                optimizer.optim_step(obs_data, i)
+                StageProfiler._sync(device)
+                if profiler:
+                    profiler.record_iteration(stage, time.perf_counter() - iter_start)
+        optimizer.cur_step = num_iters
+        with profiler.section(stage, "export_sec", device=device) if profiler else nullcontext():
+            payload = payload_from_model(data.payload, model)
+            save_pose3d_payload(payload, output)
+            save_stage_loss_plots(optimizer, output.parent, cfg)
+        return output
 
 
 def run_prior_stage(
     cfg: DictConfig,
     device: torch.device,
     frozen_init_latent_pose: torch.Tensor | None = None,
+    profiler: StageProfiler | None = None,
 ) -> Path:
     from HMP.fitting import fitting_prior
 
-    data = make_stage_data(cfg, "prior", frozen_init_latent_pose=frozen_init_latent_pose)
-    obs_data = move_to(data.obs_data(), device)
-    body_model = make_body_model(cfg, data.n_tracks * data.T, device)
-    prior_dir = resolve_path(cfg.data.work_dir) / STAGE_DIR["prior"]
-    prior_dir.mkdir(parents=True, exist_ok=True)
-    cfg.paths.base_dir = str(_REPO_ROOT.resolve())
-    cfg.HMP.exp_name = str(cfg.data.seq)
-    result = fitting_prior(
-        obs_data,
-        (move_to(res_dict_from_payload(data.payload), device),),
-        body_model,
-        cfg,
-        cfg.data,
-        str(prior_dir),
-        device,
-    )
-    if isinstance(result, tuple):
-        result_dict = result[0]
-    else:
-        result_dict = result
-    if result_dict is None:
-        npz_path = prior_dir / f"{cfg.data.seq}_000000_world_results.npz"
-        with np.load(npz_path, allow_pickle=False) as npz:
-            result_dict = {k: npz[k] for k in npz.files}
-    result_np = {k: _as_numpy(v) for k, v in result_dict.items()}
-    slam_data = latest_slam_data_for_prior(cfg, data.payload["slam_data"])
-    payload = payload_from_prior_result(data.payload, result_np, slam_data=slam_data)
-    output = stage_output_path(cfg, "prior")
-    save_pose3d_payload(payload, output)
-    collect_prior_loss_plots(prior_dir, cfg)
-    return output
+    with profiler.section("prior", "total_sec", device=device) if profiler else nullcontext():
+        with profiler.section("prior", "io_sec") if profiler else nullcontext():
+            data = make_stage_data(
+                cfg,
+                "prior",
+                frozen_init_latent_pose=frozen_init_latent_pose,
+                profiler=profiler,
+            )
+            prior_dir = resolve_path(cfg.data.work_dir) / STAGE_DIR["prior"]
+            prior_dir.mkdir(parents=True, exist_ok=True)
+        if profiler:
+            profiler.record_value("prior", "num_tracks", data.n_tracks)
+            profiler.record_value("prior", "num_frames", data.T)
+        with profiler.section("prior", "obs_build_sec", device=device) if profiler else nullcontext():
+            obs_data = move_to(data.obs_data(), device)
+            res_dict = move_to(res_dict_from_payload(data.payload), device)
+        with profiler.section("prior", "body_model_init_sec", device=device) if profiler else nullcontext():
+            body_model = make_body_model(cfg, data.n_tracks * data.T, device)
+        cfg.paths.base_dir = str(_REPO_ROOT.resolve())
+        cfg.HMP.exp_name = str(cfg.data.seq)
+        cfg.HMP.resolved_fps = float(cfg.fps)
+        profile_payload = {
+            "enabled": bool(profiler and profiler.enabled),
+            "include_iteration_samples": bool(profiler and profiler.include_iteration_samples),
+        }
+        with profiler.section("prior", "optimization_sec", device=device) if profiler else nullcontext():
+            result = fitting_prior(
+                obs_data,
+                (res_dict,),
+                body_model,
+                cfg,
+                cfg.data,
+                str(prior_dir),
+                device,
+                profile_payload=profile_payload,
+            )
+        if isinstance(result, tuple):
+            result_dict = result[0]
+        else:
+            result_dict = result
+        if result_dict is None:
+            npz_path = prior_dir / f"{cfg.data.seq}_000000_world_results.npz"
+            with profiler.section("prior", "result_npz_read_sec") if profiler else nullcontext():
+                with np.load(npz_path, allow_pickle=False) as npz:
+                    result_dict = {k: npz[k] for k in npz.files}
+        with profiler.section("prior", "export_sec", device=device) if profiler else nullcontext():
+            result_np = {k: _as_numpy(v) for k, v in result_dict.items()}
+            slam_data = latest_slam_data_for_prior(cfg, data.payload["slam_data"])
+            payload = payload_from_prior_result(data.payload, result_np, slam_data=slam_data)
+            output = stage_output_path(cfg, "prior")
+            save_pose3d_payload(payload, output)
+            collect_prior_loss_plots(prior_dir, cfg)
+        if profiler:
+            timing_path = prior_dir / "profile_prior.json"
+            if timing_path.is_file():
+                with open(timing_path) as f:
+                    profiler.merge_prior_profile(json.load(f))
+        return output
 
 
 def copy_final(src: Path, dst: Path) -> Path:
@@ -1246,43 +1516,73 @@ def select_device(cfg: DictConfig) -> torch.device:
 
 def run_from_cfg(cfg: DictConfig) -> Path:
     cfg = prepare_cfg(cfg)
-    ensure_keypoint_frames(cfg)
-    work_dir = resolve_path(cfg.data.work_dir)
-    work_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_work_dir_config(cfg, work_dir)
-    Logger.init(str(work_dir / "pose3d_hand_stages.log"))
-    device = select_device(cfg)
-    pose_prior = load_pose_prior(cfg, device)
-    original_pose_path = resolve_path(cfg.data.pose3d_hand)
-    frozen_init_latent_pose = build_frozen_init_latent_pose(
-        cfg, device, original_pose_path, pose_prior
+    profile_cfg = cfg.runtime.get("profile", {}) if "runtime" in cfg else {}
+    profiler = StageProfiler(
+        enabled=bool(profile_cfg.get("enabled", False)),
+        include_iteration_samples=bool(profile_cfg.get("include_iteration_samples", False)),
     )
-    stages = STAGE_ORDER if str(cfg.data.stage) == "all" else (str(cfg.data.stage),)
-    keep_resume = bool(cfg.data.resume)
-    last_output = original_pose_path
-    for stage in stages:
-        existing = try_latest_stage_output(cfg, stage) if keep_resume else None
-        if existing is not None:
-            Logger.log(f"resume: skip {stage}, use {existing}")
-            last_output = existing
-        elif stage in {"root", "smooth"}:
-            last_output = run_root_or_smooth(
-                cfg,
-                stage,
-                device,
-                frozen_init_latent_pose=frozen_init_latent_pose,
-                pose_prior=pose_prior,
+    with profiler.section([], "total_sec") if profiler.enabled else nullcontext():
+        original_pose_path = resolve_path(cfg.data.pose3d_hand)
+        with profiler.section("startup", "pose_payload_read_sec") if profiler.enabled else nullcontext():
+            original_pose_payload = load_pose3d_payload(original_pose_path)
+        with profiler.section("startup", "fps_resolve_sec") if profiler.enabled else nullcontext():
+            resolved_fps = resolve_runtime_fps(cfg, original_pose_payload)
+        print(f"Using runtime FPS: {resolved_fps:.6g}")
+        ensure_keypoint_frames(cfg, profiler=profiler)
+        work_dir = resolve_path(cfg.data.work_dir)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        with profiler.section("startup", "config_snapshot_sec") if profiler.enabled else nullcontext():
+            snapshot_work_dir_config(cfg, work_dir)
+        Logger.init(str(work_dir / "pose3d_hand_stages.log"))
+        with profiler.section("startup", "device_select_sec") if profiler.enabled else nullcontext():
+            device = select_device(cfg)
+        with profiler.section("startup", "pose_prior_load_sec", device=device) if profiler.enabled else nullcontext():
+            pose_prior = load_pose_prior(cfg, device)
+        with profiler.section("startup", "frozen_init_latent_pose_sec", device=device) if profiler.enabled else nullcontext():
+            frozen_init_latent_pose = build_frozen_init_latent_pose(
+                cfg, device, original_pose_path, pose_prior
             )
-        elif stage == "prior":
-            last_output = run_prior_stage(
-                cfg, device, frozen_init_latent_pose=frozen_init_latent_pose
-            )
-        else:
-            raise ValueError(f"Unknown stage: {stage}")
-        cfg.data.pose3d_hand = str(last_output)
-        if not keep_resume:
-            cfg.data.resume = False
-    final_output = copy_final(last_output, resolve_path(cfg.data.output))
+        stages = STAGE_ORDER if str(cfg.data.stage) == "all" else (str(cfg.data.stage),)
+        keep_resume = bool(cfg.data.resume)
+        last_output = original_pose_path
+        for stage in stages:
+            existing = try_latest_stage_output(cfg, stage) if keep_resume else None
+            if existing is not None:
+                Logger.log(f"resume: skip {stage}, use {existing}")
+                last_output = existing
+                if profiler.enabled:
+                    profiler.record_value(stage, "resume_skipped", True)
+            elif stage in {"root", "smooth"}:
+                last_output = run_root_or_smooth(
+                    cfg,
+                    stage,
+                    device,
+                    frozen_init_latent_pose=frozen_init_latent_pose,
+                    pose_prior=pose_prior,
+                    profiler=profiler,
+                )
+            elif stage == "prior":
+                last_output = run_prior_stage(
+                    cfg,
+                    device,
+                    frozen_init_latent_pose=frozen_init_latent_pose,
+                    profiler=profiler,
+                )
+            else:
+                raise ValueError(f"Unknown stage: {stage}")
+            cfg.data.pose3d_hand = str(last_output)
+            if not keep_resume:
+                cfg.data.resume = False
+        with profiler.section("finalize", "copy_final_sec") if profiler.enabled else nullcontext():
+            final_output = copy_final(last_output, resolve_path(cfg.data.output))
+    if profiler.enabled:
+        profile_output = profile_cfg.get("output", None)
+        profile_path = resolve_path(profile_output) if profile_output else resolve_path(cfg.data.work_dir) / "profile.json"
+        profiler.write_json(profile_path)
+        if bool(profile_cfg.get("print_summary", True)):
+            for line in profiler.summary_lines():
+                Logger.log(line)
+        Logger.log(f"Saved profile to {profile_path}")
     print(f"Saved final pose3d_hand to {final_output}")
     return final_output
 

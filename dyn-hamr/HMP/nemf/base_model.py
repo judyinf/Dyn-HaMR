@@ -42,7 +42,12 @@ class BaseModel(ABC):
     def __init__(self, args):
         self.args = args
         self.is_train = args.is_train
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device_name = getattr(args, 'device', None)
+        if device_name is None:
+            device_name = 'cuda' if torch.cuda.is_available() else 'cpu'
+        if str(device_name).startswith('cuda') and not torch.cuda.is_available():
+            device_name = 'cpu'
+        self.device = torch.device(device_name)
         self.model_save_dir = os.path.join(args.save_dir, 'checkpoints')  # save all the checkpoints to save_dir
 
         if self.is_train and args.log:

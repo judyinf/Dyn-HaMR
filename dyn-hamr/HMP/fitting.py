@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import numpy as np
 import torch.nn as nn
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from loguru import logger 
 from argparse import Namespace
 import matplotlib.pyplot as plt
@@ -68,6 +69,113 @@ MANO_JOINTS = {
     'thumb2': 14,
     'thumb3': 15,
 }
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _as_plain_config(value):
+    if isinstance(value, dict):
+        return {k: _as_plain_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_as_plain_config(v) for v in value]
+    try:
+        from omegaconf import DictConfig, ListConfig, OmegaConf
+        if isinstance(value, (DictConfig, ListConfig)):
+            return OmegaConf.to_container(value, resolve=True)
+    except Exception:
+        pass
+    return value
+
+
+def _to_namespace(value):
+    if isinstance(value, dict):
+        return Namespace(**{k: _to_namespace(v) for k, v in value.items()})
+    if isinstance(value, list):
+        return [_to_namespace(v) for v in value]
+    return value
+
+
+def _available_device_name(device_name):
+    if str(device_name).startswith("cuda") and not torch.cuda.is_available():
+        return "cpu"
+    return str(device_name)
+
+
+def _device_for_job(devices, index, fallback):
+    devices = list(devices or [])
+    if not devices:
+        return _available_device_name(fallback)
+    return _available_device_name(devices[index % len(devices)])
+
+
+def _normalize_hmp_fps_for_stats(args):
+    fps = float(args.data.fps)
+    rounded = int(round(fps))
+    if abs(fps - rounded) < 1e-4:
+        args.data.fps = rounded
+        return
+
+    mean_path = os.path.join(
+        args.dataset_dir,
+        f'mean-{args.data.gender}-{args.data.clip_length}-{args.data.fps}fps.pt',
+    )
+    if os.path.isfile(mean_path):
+        return
+
+    rounded_mean_path = os.path.join(
+        args.dataset_dir,
+        f'mean-{args.data.gender}-{args.data.clip_length}-{rounded}fps.pt',
+    )
+    if os.path.isfile(rounded_mean_path):
+        logger.warning(
+            f'HMP stats for {fps:.6g}fps not found; using nearest integer stats {rounded}fps'
+        )
+        args.data.fps = rounded
+
+
+def _configure_hmp_args(base_dir, hmp_config, save_path, vid_path, dataname, resolved_fps=None):
+    global args, motion_prior_type, hposer
+    args = Arguments(base_dir, os.path.dirname(__file__), filename=hmp_config)
+    if resolved_fps is not None:
+        args.data.fps = float(resolved_fps)
+
+    args.save_path = save_path
+    args.plot_loss = True
+    args.vid_path = vid_path
+    args.dataname = dataname
+    args.root = base_dir
+    args.dataset_dir = os.path.join(base_dir, '_DATA/hmp_model')
+    args.save_dir = os.path.join(base_dir, '_DATA/hmp_model')
+    _normalize_hmp_fps_for_stats(args)
+
+    if hasattr(args, 'motion_prior_type'):
+        raise ValueError
+    motion_prior_type = "hmp"
+    hposer = None
+    return args
+
+
+def _init_hmp_model(device_name):
+    global model, fk, ngpu
+    ngpu = 1
+    device_name = _available_device_name(device_name)
+    if str(device_name).startswith("cuda") and torch.cuda.is_available():
+        try:
+            torch.cuda.set_device(torch.device(device_name))
+        except Exception as exc:
+            logger.warning(f'Could not set CUDA device {device_name}: {exc}')
+    args.device = device_name
+    model = Architecture(args, ngpu)
+    model.load(optimal=True)
+    model.eval()
+    fk = ForwardKinematicsLayer(args)
+    return torch.device(device_name)
 def run_mano(body_model, trans, root_orient, body_pose, is_right, betas=None, only_right=False):
     """
     Forward pass of the MANO model and populates pred_data accordingly with
@@ -731,6 +839,138 @@ def _build_window_target(data):
     }
 
 
+def _copy_window_loss_artifacts(window_dir, pkl_output_dir):
+    loss_summary = os.path.join(pkl_output_dir, "all_stages_loss.jpg")
+    if os.path.isfile(loss_summary):
+        shutil.copy2(loss_summary, os.path.join(window_dir, "all_stages_loss.jpg"))
+    for loss_plot in glob.glob(os.path.join(pkl_output_dir, "stage_*_loss.jpg")):
+        shutil.copy2(loss_plot, os.path.join(window_dir, os.path.basename(loss_plot)))
+
+
+def _move_tensors_to_cpu(data):
+    out = {}
+    for key, value in data.items():
+        if torch.is_tensor(value):
+            out[key] = value.detach().cpu()
+        else:
+            out[key] = value
+    return out
+
+
+def _hmp_profile_enabled():
+    return bool(getattr(args, 'profile_enabled', False))
+
+
+def _hmp_profile_sync():
+    if _hmp_profile_enabled() and hasattr(model, 'device'):
+        device = model.device
+        if device.type == 'cuda' and torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+
+
+def _iteration_stats(samples):
+    if not samples:
+        return {"count": 0, "total_sec": 0.0, "mean_sec": 0.0, "min_sec": None, "max_sec": None}
+    total = float(sum(samples))
+    stats = {
+        "count": len(samples),
+        "total_sec": total,
+        "mean_sec": total / len(samples),
+        "min_sec": float(min(samples)),
+        "max_sec": float(max(samples)),
+    }
+    if bool(getattr(args, 'profile_include_iteration_samples', False)):
+        stats["samples_sec"] = [float(v) for v in samples]
+    return stats
+
+
+def _write_json(path, payload):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        json.dump(payload, f, indent=2)
+
+
+def _optimize_window_current_process(
+    hand_model,
+    window_data,
+    valid_len,
+    window_dir,
+    hand_idx,
+    window_meta=None,
+):
+    window_profile = dict(window_meta or {})
+    window_profile.update({"hand_idx": hand_idx, "valid_len": valid_len, "hmp_stages": {}})
+    profile_start = time.perf_counter()
+    args._current_window_profile = window_profile
+    args.pkl_output_dir = os.path.join(window_dir, '.optimization_tmp')
+    os.makedirs(args.pkl_output_dir, exist_ok=True)
+
+    section_start = time.perf_counter()
+    model.set_input(window_data)
+    if _hmp_profile_enabled():
+        window_profile["model_set_input_sec"] = time.perf_counter() - section_start
+    section_start = time.perf_counter()
+    target = _build_window_target(window_data)
+    if _hmp_profile_enabled():
+        window_profile["target_build_sec"] = time.perf_counter() - section_start
+    valid_frames = torch.arange(valid_len, device=model.device)
+    section_start = time.perf_counter()
+    R, T, P, Be, DR = motion_reconstruction(
+        hand_model, target, window_dir, steps=[1.0], T=valid_frames, idx=hand_idx
+    )
+    if _hmp_profile_enabled():
+        window_profile["motion_reconstruction_sec"] = time.perf_counter() - section_start
+    window_result = {
+        'root_orient': R[0, :valid_len].detach().cpu().numpy(),
+        'trans': T[0, :valid_len].detach().cpu().numpy(),
+        'pose_body': P[0, :valid_len].detach().cpu().numpy(),
+        'betas': Be[0].detach().cpu().numpy(),
+        'decode_root': DR[0, :valid_len].detach().cpu().numpy(),
+    }
+    section_start = time.perf_counter()
+    _copy_window_loss_artifacts(window_dir, args.pkl_output_dir)
+    shutil.rmtree(args.pkl_output_dir)
+    np.savez(os.path.join(window_dir, 'final.npz'), **window_result)
+    if _hmp_profile_enabled():
+        window_profile["export_sec"] = time.perf_counter() - section_start
+        window_profile["total_sec"] = time.perf_counter() - profile_start
+        _write_json(os.path.join(window_dir, 'timing.json'), window_profile)
+    args._current_window_profile = None
+    return window_result
+
+
+def _window_worker(job):
+    global args
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+    _configure_hmp_args(
+        job['base_dir'],
+        job['hmp_config'],
+        job['save_path'],
+        job['vid_path'],
+        job['dataname'],
+        job.get('resolved_fps'),
+    )
+    args.profile_enabled = bool(job.get('profile', {}).get('enabled', False))
+    args.profile_include_iteration_samples = bool(
+        job.get('profile', {}).get('include_iteration_samples', False)
+    )
+    device = _init_hmp_model(job['device'])
+    from body_model import MANO
+
+    mano_cfg = {str(k).lower(): v for k, v in job['mano_cfg'].items()}
+    hand_model = MANO(batch_size=job['mano_batch_size'], pose2rot=True, **mano_cfg).to(device)
+    return _optimize_window_current_process(
+        hand_model,
+        job['window_data'],
+        job['valid_len'],
+        job['window_dir'],
+        job['hand_idx'],
+        job.get('window_meta'),
+    )
+
+
 def _apply_temporal_filter(result):
     filter_cfg = getattr(args, 'temporal_filter', None)
     filter_type = getattr(filter_cfg, 'type', 'none') if filter_cfg else 'none'
@@ -768,6 +1008,216 @@ def _stitch_hand_windows(windows, intervals, seq_len):
         'betas': np.mean([window['betas'] for window in windows], axis=0),
     }
     return _apply_temporal_filter(result)
+
+
+def _load_window_timing(window_result_relpath, diagnostics_dir):
+    timing_path = os.path.join(
+        diagnostics_dir,
+        os.path.dirname(window_result_relpath),
+        'timing.json',
+    )
+    if not os.path.isfile(timing_path):
+        return None
+    with open(timing_path) as f:
+        return json.load(f)
+
+
+def _summarize_prior_profile(windows_metadata, diagnostics_dir):
+    prior_profile = {"hands": []}
+    total_sec = 0.0
+    for hand_meta in windows_metadata.get('hands', []):
+        hand_profile = {
+            "hand_idx": hand_meta.get("hand_idx"),
+            "seq_len": hand_meta.get("seq_len"),
+            "windows": [],
+            "total_sec": 0.0,
+        }
+        for window_meta in hand_meta.get('windows', []):
+            timing = _load_window_timing(window_meta['result'], diagnostics_dir)
+            if timing is None:
+                timing = dict(window_meta)
+            hand_profile["windows"].append(timing)
+            hand_profile["total_sec"] += float(timing.get("total_sec", 0.0))
+        total_sec += hand_profile["total_sec"]
+        prior_profile["hands"].append(hand_profile)
+    prior_profile["hmp_windows_total_sec"] = total_sec
+    return prior_profile
+
+
+def _window_parallel_cfg(opt):
+    parallel = _cfg_get(_cfg_get(opt.HMP, 'parallel', {}), 'window', {})
+    enabled = bool(_cfg_get(parallel, 'enabled', False))
+    workers = int(_cfg_get(parallel, 'workers_per_hand', 1) or 1)
+    devices = _cfg_get(parallel, 'devices', None)
+    return enabled and workers > 1, workers, devices
+
+
+def _hand_parallel_cfg(opt):
+    parallel = _cfg_get(_cfg_get(opt.HMP, 'parallel', {}), 'hand', {})
+    enabled = bool(_cfg_get(parallel, 'enabled', False))
+    workers = int(_cfg_get(parallel, 'workers', 1) or 1)
+    devices = _cfg_get(parallel, 'devices', None)
+    return enabled and workers > 1, workers, devices
+
+
+def _build_hand_stage2_data(opt, device, obs_data, res_dict, hand_model, hand_idx, abs_video_path, config_type):
+    if not (res_dict['is_right'][hand_idx] == obs_data['is_right'][hand_idx]).all():
+        raise ValueError(f"Handedness mismatch for hand {hand_idx}")
+
+    seq_len = len(res_dict['trans'][hand_idx])
+    cam_center = torch.tensor(res_dict['intrins'][2:][None]).repeat(seq_len, 1)
+    cam_f = torch.tensor(res_dict['intrins'][:2][None]).repeat(seq_len, 1)
+    init_dict = {
+        'keyp2d': obs_data['joints2d'][hand_idx],
+        'betas': res_dict['betas'][hand_idx],
+        'trans': res_dict['trans'][hand_idx],
+        'root_orient': res_dict['root_orient'][hand_idx],
+        'poses': res_dict['pose_body'][hand_idx].reshape(-1, 45),
+        'cam_R': res_dict['cam_R'][hand_idx],
+        'cam_t': res_dict['cam_t'][hand_idx],
+        'img_dir': abs_video_path,
+        'is_right': res_dict['is_right'][hand_idx],
+        'cam_f': cam_f,
+        'cam_center': cam_center,
+        'vis_mask': obs_data['vis_mask'][hand_idx],
+    }
+    data = get_stage2_res(opt.paths.base_dir, device, init_dict, hand_model)
+    data['save_path'] = os.path.join(args.save_path, 'pymaf_output.npz')
+    data['config_type'] = config_type
+    return data, seq_len
+
+
+def _optimize_hand_current_process(
+    opt,
+    device,
+    obs_data,
+    res_dict,
+    hand_model,
+    hand_idx,
+    abs_video_path,
+    config_type,
+    diagnostics_dir,
+):
+    data, seq_len = _build_hand_stage2_data(
+        opt, device, obs_data, res_dict, hand_model, hand_idx, abs_video_path, config_type
+    )
+    args.orig_seq_len = seq_len
+
+    clip_len = args.data.clip_length
+    intervals = compute_seq_intervals(seq_len, clip_len, args.overlap_len)
+    hand_metadata = {'hand_idx': hand_idx, 'seq_len': seq_len, 'windows': []}
+    hand_windows = [None] * len(intervals)
+    window_parallel_enabled, window_workers, window_devices = _window_parallel_cfg(opt)
+    window_jobs = []
+
+    for window_idx, (start, end) in enumerate(intervals):
+        window_data, valid_len = _build_window_data(data, start, end, clip_len)
+        window_dir = os.path.join(
+            diagnostics_dir, f'hand-{hand_idx}', f'window-{start:06d}-{end:06d}'
+        )
+        os.makedirs(window_dir, exist_ok=True)
+        hand_metadata['windows'].append({
+            'start': start,
+            'end': end,
+            'valid_len': valid_len,
+            'padded_len': clip_len - valid_len,
+            'result': os.path.relpath(os.path.join(window_dir, 'final.npz'), diagnostics_dir),
+        })
+        if window_parallel_enabled:
+            window_jobs.append({
+                'window_idx': window_idx,
+                'base_dir': opt.paths.base_dir,
+                'hmp_config': opt.HMP.config,
+                'save_path': args.save_path,
+                'vid_path': args.vid_path,
+                'dataname': args.dataname,
+                'resolved_fps': getattr(args.data, 'fps', None),
+                'device': _device_for_job(window_devices, window_idx, str(device)),
+                'mano_cfg': _as_plain_config(opt.MANO),
+                'mano_batch_size': clip_len,
+                'window_data': _move_tensors_to_cpu(window_data),
+                'valid_len': valid_len,
+                'window_dir': window_dir,
+                'hand_idx': hand_idx,
+                'window_meta': {
+                    'window_idx': window_idx,
+                    'start': start,
+                    'end': end,
+                    'padded_len': clip_len - valid_len,
+                },
+                'profile': {
+                    'enabled': _hmp_profile_enabled(),
+                    'include_iteration_samples': bool(
+                        getattr(args, 'profile_include_iteration_samples', False)
+                    ),
+                },
+            })
+        else:
+            hand_windows[window_idx] = _optimize_window_current_process(
+                hand_model,
+                window_data,
+                valid_len,
+                window_dir,
+                hand_idx,
+                {
+                    'window_idx': window_idx,
+                    'start': start,
+                    'end': end,
+                    'padded_len': clip_len - valid_len,
+                },
+            )
+
+    if window_parallel_enabled:
+        logger.info(
+            f'Running HMP hand {hand_idx} windows in parallel with {window_workers} workers'
+        )
+        with ProcessPoolExecutor(max_workers=window_workers) as executor:
+            futures = {executor.submit(_window_worker, job): job['window_idx'] for job in window_jobs}
+            for future in as_completed(futures):
+                hand_windows[futures[future]] = future.result()
+
+    return _stitch_hand_windows(hand_windows, intervals, seq_len), hand_metadata
+
+
+def _hand_worker(job):
+    global args
+    torch.manual_seed(0)
+    np.random.seed(0)
+    random.seed(0)
+    opt = _to_namespace(job['opt'])
+    _configure_hmp_args(
+        job['base_dir'],
+        job['hmp_config'],
+        job['save_path'],
+        job['vid_path'],
+        job['dataname'],
+        job.get('resolved_fps'),
+    )
+    args.profile_enabled = bool(job.get('profile', {}).get('enabled', False))
+    args.profile_include_iteration_samples = bool(
+        job.get('profile', {}).get('include_iteration_samples', False)
+    )
+    window_parallel_enabled, _, _ = _window_parallel_cfg(opt)
+    if window_parallel_enabled:
+        device = torch.device(_available_device_name(job['device']))
+    else:
+        device = _init_hmp_model(job['device'])
+    from body_model import MANO
+
+    mano_cfg = {str(k).lower(): v for k, v in job['mano_cfg'].items()}
+    hand_model = MANO(batch_size=job['mano_batch_size'], pose2rot=True, **mano_cfg).to(device)
+    stitched, metadata = _optimize_hand_current_process(
+        opt,
+        device,
+        job['obs_data'],
+        job['res_dict'],
+        hand_model,
+        job['hand_idx'],
+        job['abs_video_path'],
+        job['config_type'],
+        job['diagnostics_dir'],
+    )
+    return job['hand_idx'], stitched, metadata
 
 
 def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_setup_name, init_method_name):
@@ -812,80 +1262,71 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
         'hands': [],
     }
     stitched_hands = []
+    hand_parallel_enabled, hand_workers, hand_devices = _hand_parallel_cfg(opt)
+    n_hands = len(res_dict['pose_body'])
 
-    for hand_idx in range(len(res_dict['pose_body'])):
-        if not (res_dict['is_right'][hand_idx] == obs_data['is_right'][hand_idx]).all():
-            raise ValueError(f"Handedness mismatch for hand {hand_idx}")
-
-        seq_len = len(res_dict['trans'][hand_idx])
-        cam_center = torch.tensor(res_dict['intrins'][2:][None]).repeat(seq_len, 1)
-        cam_f = torch.tensor(res_dict['intrins'][:2][None]).repeat(seq_len, 1)
-        init_dict = {
-            'keyp2d': obs_data['joints2d'][hand_idx],
-            'betas': res_dict['betas'][hand_idx],
-            'trans': res_dict['trans'][hand_idx],
-            'root_orient': res_dict['root_orient'][hand_idx],
-            'poses': res_dict['pose_body'][hand_idx].reshape(-1, 45),
-            'cam_R': res_dict['cam_R'][hand_idx],
-            'cam_t': res_dict['cam_t'][hand_idx],
-            'img_dir': abs_video_path,
-            'is_right': res_dict['is_right'][hand_idx],
-            'cam_f': cam_f,
-            'cam_center': cam_center,
-            'vis_mask': obs_data['vis_mask'][hand_idx],
-        }
-        data = get_stage2_res(opt.paths.base_dir, device, init_dict, hand_model)
-        data['save_path'] = os.path.join(args.save_path, 'pymaf_output.npz')
-        data['config_type'] = config_type
-        args.orig_seq_len = seq_len
-
-        intervals = compute_seq_intervals(seq_len, clip_len, args.overlap_len)
-        hand_metadata = {'hand_idx': hand_idx, 'seq_len': seq_len, 'windows': []}
-        hand_windows = []
-        for start, end in intervals:
-            window_data, valid_len = _build_window_data(data, start, end, clip_len)
-            window_dir = os.path.join(
-                diagnostics_dir, f'hand-{hand_idx}', f'window-{start:06d}-{end:06d}'
+    if hand_parallel_enabled:
+        logger.info(f'Running HMP hands in parallel with {hand_workers} workers')
+        stitched_hands = [None] * n_hands
+        hand_metadata_by_idx = [None] * n_hands
+        opt_plain = _as_plain_config(opt)
+        with ProcessPoolExecutor(max_workers=hand_workers) as executor:
+            futures = {}
+            for hand_idx in range(n_hands):
+                seq_len = len(res_dict['trans'][hand_idx])
+                job = {
+                    'base_dir': opt.paths.base_dir,
+                    'hmp_config': opt.HMP.config,
+                    'save_path': args.save_path,
+                    'vid_path': args.vid_path,
+                    'dataname': args.dataname,
+                    'resolved_fps': getattr(args.data, 'fps', None),
+                    'device': _device_for_job(hand_devices, hand_idx, str(device)),
+                    'mano_cfg': _as_plain_config(opt.MANO),
+                    'mano_batch_size': seq_len,
+                    'opt': opt_plain,
+                    'obs_data': obs_data,
+                    'res_dict': res_dict,
+                    'hand_idx': hand_idx,
+                    'abs_video_path': abs_video_path,
+                    'config_type': config_type,
+                    'diagnostics_dir': diagnostics_dir,
+                    'profile': {
+                        'enabled': _hmp_profile_enabled(),
+                        'include_iteration_samples': bool(
+                            getattr(args, 'profile_include_iteration_samples', False)
+                        ),
+                    },
+                }
+                futures[executor.submit(_hand_worker, job)] = hand_idx
+            for future in as_completed(futures):
+                hand_idx, stitched, hand_metadata = future.result()
+                stitched_hands[hand_idx] = stitched
+                hand_metadata_by_idx[hand_idx] = hand_metadata
+        windows_metadata['hands'].extend(hand_metadata_by_idx)
+    else:
+        for hand_idx in range(n_hands):
+            stitched, hand_metadata = _optimize_hand_current_process(
+                opt,
+                device,
+                obs_data,
+                res_dict,
+                hand_model,
+                hand_idx,
+                abs_video_path,
+                config_type,
+                diagnostics_dir,
             )
-            args.pkl_output_dir = os.path.join(window_dir, '.optimization_tmp')
-            os.makedirs(args.pkl_output_dir, exist_ok=True)
-
-            model.set_input(window_data)
-            target = _build_window_target(window_data)
-            valid_frames = torch.arange(valid_len, device=model.device)
-            R, T, P, Be, DR = motion_reconstruction(
-                hand_model, target, window_dir, steps=[1.0], T=valid_frames, idx=hand_idx
-            )
-            window_result = {
-                'root_orient': R[0, :valid_len].detach().cpu().numpy(),
-                'trans': T[0, :valid_len].detach().cpu().numpy(),
-                'pose_body': P[0, :valid_len].detach().cpu().numpy(),
-                'betas': Be[0].detach().cpu().numpy(),
-                'decode_root': DR[0, :valid_len].detach().cpu().numpy(),
-            }
-            loss_summary = os.path.join(args.pkl_output_dir, "all_stages_loss.jpg")
-            if os.path.isfile(loss_summary):
-                shutil.copy2(loss_summary, os.path.join(window_dir, "all_stages_loss.jpg"))
-            for loss_plot in glob.glob(os.path.join(args.pkl_output_dir, "stage_*_loss.jpg")):
-                shutil.copy2(loss_plot, os.path.join(window_dir, os.path.basename(loss_plot)))
-            shutil.rmtree(args.pkl_output_dir)
-            np.savez(os.path.join(window_dir, 'final.npz'), **window_result)
-            hand_windows.append(window_result)
-            hand_metadata['windows'].append({
-                'start': start,
-                'end': end,
-                'valid_len': valid_len,
-                'padded_len': clip_len - valid_len,
-                'result': os.path.relpath(
-                    os.path.join(window_dir, 'final.npz'), diagnostics_dir
-                ),
-            })
-
-        stitched_hands.append(_stitch_hand_windows(hand_windows, intervals, seq_len))
-        windows_metadata['hands'].append(hand_metadata)
+            stitched_hands.append(stitched)
+            windows_metadata['hands'].append(hand_metadata)
 
     with open(os.path.join(diagnostics_dir, 'windows.json'), 'w') as f:
         json.dump(windows_metadata, f, indent=2)
+    if _hmp_profile_enabled():
+        _write_json(
+            os.path.join(args.save_path, 'profile_prior.json'),
+            _summarize_prior_profile(windows_metadata, diagnostics_dir),
+        )
 
     res_dict['root_orient'] = np.stack([hand['root_orient'] for hand in stitched_hands])
     res_dict['trans'] = np.stack([hand['trans'] for hand in stitched_hands])
@@ -1403,7 +1844,10 @@ def optim_step(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
     # optimize the z_l and root_orient, pos, trans, 2d kp objectives
     start_time = time.time()
     print(f'start latent optimization... {stg_conf.niters} iters')
+    iter_samples = []
     for i in range(stg_conf.niters):
+        _hmp_profile_sync()
+        iter_start = time.perf_counter()
         optimizer.zero_grad()
 
         if motion_prior_type == "hmp":
@@ -1606,8 +2050,17 @@ def optim_step(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
             loss_dict[k] = v.item()
             loss_log_str += f'{k}: {v.item():.3f}\t'
         logger.info(loss_log_str)
+        if _hmp_profile_enabled():
+            _hmp_profile_sync()
+            iter_samples.append(time.perf_counter() - iter_start)
         
     end_time = time.time()
+    if _hmp_profile_enabled() and getattr(args, '_current_window_profile', None) is not None:
+        args._current_window_profile.setdefault("hmp_stages", {})[f"stg{stg_id + 1}"] = {
+            "niters": int(stg_conf.niters),
+            "iterations": _iteration_stats(iter_samples),
+            "total_sec": float(sum(iter_samples)),
+        }
     
     # save the loss dict. 
     joblib.dump(loss_dict_by_step, open(os.path.join(args.pkl_output_dir, f'stage_{stg_id}_loss.pkl'), 'wb'))
@@ -1620,32 +2073,30 @@ def optim_step(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
     
     return z_l, z_g, cam_R, cam_t, trans, root_orient, betas, pose
 
-def fitting_prior(obs_data, res_dict, hand_model, opt, data_args, out_dir, device):
+def fitting_prior(obs_data, res_dict, hand_model, opt, data_args, out_dir, device, profile_payload=None):
     global model, fk, ngpu, hposer, motion_prior_type, pca_aa, gmm_aa, args
-    args = Arguments(opt.paths.base_dir, os.path.dirname(__file__), filename=opt.HMP.config)
-
     opt.HMP.exp_name = data_args.seq
-    
+
     cfg_name = opt.HMP.config.split(".")[0]
     opt.HMP.use_hposer = False
-    
-    args.save_path = out_dir
-    args.plot_loss = True
-
-    args.vid_path = opt.HMP.vid_path
-    args.dataname = data_args.seq
-
-    args.root = opt.paths.base_dir
-    args.dataset_dir = os.path.join(opt.paths.base_dir, '_DATA/hmp_model')
-    args.save_dir = os.path.join(opt.paths.base_dir, '_DATA/hmp_model')
+    resolved_fps = _cfg_get(opt.HMP, 'resolved_fps', None)
+    _configure_hmp_args(
+        opt.paths.base_dir,
+        opt.HMP.config,
+        out_dir,
+        opt.HMP.vid_path,
+        data_args.seq,
+        resolved_fps,
+    )
+    profile_payload = profile_payload or {}
+    args.profile_enabled = bool(profile_payload.get('enabled', False))
+    args.profile_include_iteration_samples = bool(
+        profile_payload.get('include_iteration_samples', False)
+    )
+    args._current_window_profile = None
 
     init_method = args.init_method if hasattr(args, 'init_method') else "pymafx"
     assert init_method in ["metro", "pymafx"]
-    
-    if hasattr(args, 'motion_prior_type'):
-        raise ValueError
-    else:
-        motion_prior_type = "hmp"
 
     assert motion_prior_type in ["hmp"]
 
@@ -1662,13 +2113,10 @@ def fitting_prior(obs_data, res_dict, hand_model, opt, data_args, out_dir, devic
     np.random.seed(0)
     random.seed(0)
     
-    ngpu = 1
-
-    model = Architecture(args, ngpu)
-    model.load(optimal=True)
-    model.eval()
-
-    fk = ForwardKinematicsLayer(args)
+    hand_parallel_enabled, _, _ = _hand_parallel_cfg(opt)
+    window_parallel_enabled, _, _ = _window_parallel_cfg(opt)
+    if not hand_parallel_enabled and not window_parallel_enabled:
+        _init_hmp_model(str(device))
     return multi_stage_opt(
         opt,
         device,
