@@ -49,6 +49,7 @@ HMP:
   use_hposer: False
   vid_path: ${data.sources.images}
   exp_name: None
+  resolved_fps: null
   parallel:
     hand:
       enabled: true
@@ -64,6 +65,7 @@ HMP:
 runtime:
   fps: auto
   fps_tolerance: 0.5
+  resolved_fps: null
   profile:
     enabled: true
     output: ../outputs/logs/profile_${data.name}.json
