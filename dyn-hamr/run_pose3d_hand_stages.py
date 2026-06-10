@@ -15,6 +15,7 @@ from typing import Any
 import hydra
 import numpy as np
 import torch
+from loguru import logger
 from omegaconf import DictConfig, OmegaConf
 from scipy.interpolate import interp1d
 from scipy.spatial.transform import Rotation
@@ -31,12 +32,19 @@ sys.path.append(str(_REPO_ROOT / "third-party/hamer/third-party/ViTPose"))
 from body_model import MANO, OP_NUM_JOINTS
 from preproc.extract_frames import video_to_frames
 from util.loaders import resolve_cfg_paths
-from util.logger import Logger
 from util.tensor import move_to
 
 
 STAGE_ORDER = ("root", "smooth", "prior")
 STAGE_DIR = {"root": "root_fit", "smooth": "smooth_fit", "prior": "prior"}
+
+
+def configure_stage_logging(log_path: Path | None = None, level: str = "INFO") -> None:
+    logger.remove()
+    logger.add(sys.stdout, level=level, enqueue=True)
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logger.add(str(log_path), level=level, enqueue=True)
 
 
 class StageProfiler:
@@ -713,7 +721,7 @@ def load_pose_prior(cfg: DictConfig, device: torch.device) -> Any | None:
     from util.loaders import load_vposer
 
     expr_dir = resolve_path(cfg.paths.vposer)
-    Logger.log(f"Loading VPoser pose prior from {expr_dir}")
+    logger.info(f"Loading VPoser pose prior from {expr_dir}")
     pose_prior, _ = load_vposer(str(expr_dir), vp_model="snapshot")
     return pose_prior.to(device).eval()
 
@@ -723,12 +731,16 @@ def build_frozen_init_latent_pose(
     device: torch.device,
     original_pose_path: Path,
     pose_prior: Any | None,
+    body_model_cache: "BodyModelCache | None" = None,
 ) -> torch.Tensor:
     body_pose = init_body_pose_from_pose_path(original_pose_path)
     if pose_prior is None:
         return body_pose.reshape(body_pose.shape[0], body_pose.shape[1], -1)
     b, t = body_pose.shape[:2]
-    hand_model = make_body_model(cfg, b * t, device)
+    if body_model_cache is None:
+        hand_model = make_body_model(cfg, b * t, device)
+    else:
+        hand_model = body_model_cache.get(b * t, device)
     return init_latent_pose_from_body_pose(body_pose, pose_prior, hand_model.hand_mean)
 
 
@@ -1156,9 +1168,9 @@ def save_stage_loss_plots(optimizer: Any, stage_dir: Path, cfg: DictConfig) -> N
     stage_dir.mkdir(parents=True, exist_ok=True)
     try:
         optimizer.plot_losses(str(stage_dir))
-        Logger.log(f"Saved loss plots to {stage_dir}")
+        logger.info(f"Saved loss plots to {stage_dir}")
     except Exception as exc:
-        Logger.log(f"WARNING: failed to save loss plots to {stage_dir}: {exc}")
+        logger.warning(f"failed to save loss plots to {stage_dir}: {exc}")
 
 
 def stage_input(cfg: DictConfig, stage: str) -> Path:
@@ -1212,7 +1224,7 @@ def snapshot_work_dir_config(cfg: DictConfig, work_dir: Path) -> None:
         src = Path.cwd() / ".hydra" / name
         if src.is_file():
             shutil.copy2(src, hydra_dir / name)
-    Logger.log(f"Saved config snapshot to {hydra_dir}")
+        logger.info(f"Saved config snapshot to {hydra_dir}")
 
 
 def collect_prior_loss_plots(prior_dir: Path, cfg: DictConfig) -> None:
@@ -1224,9 +1236,9 @@ def collect_prior_loss_plots(prior_dir: Path, cfg: DictConfig) -> None:
         src = summary_candidates[-1]
         if src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
-        Logger.log(f"Collected prior loss summary to {dst}")
+        logger.info(f"Collected prior loss summary to {dst}")
     else:
-        Logger.log(f"WARNING: no all_stages_loss.jpg found under {prior_dir}")
+        logger.warning(f"no all_stages_loss.jpg found under {prior_dir}")
 
     for src in sorted(prior_dir.rglob("stage_*_loss.jpg")):
         if src.parent.resolve() == prior_dir.resolve():
@@ -1236,7 +1248,7 @@ def collect_prior_loss_plots(prior_dir: Path, cfg: DictConfig) -> None:
         if dst.resolve() == src.resolve() or dst.is_file():
             continue
         shutil.copy2(src, dst)
-        Logger.log(f"Collected prior stage loss plot to {dst}")
+        logger.info(f"Collected prior stage loss plot to {dst}")
 
 
 def has_image_frames(path: Path) -> bool:
@@ -1299,8 +1311,8 @@ def resolve_runtime_fps(cfg: DictConfig, pose_payload: dict[str, Any]) -> float:
             )
         resolved = video_fps
         if diff > 1e-4:
-            print(
-                f"WARNING: video FPS {video_fps:.6g} differs from pose3d_hand FPS "
+            logger.warning(
+                f"video FPS {video_fps:.6g} differs from pose3d_hand FPS "
                 f"{pose_fps:.6g}; using video FPS"
             )
     elif video_fps is not None:
@@ -1309,7 +1321,7 @@ def resolve_runtime_fps(cfg: DictConfig, pose_payload: dict[str, Any]) -> float:
         resolved = pose_fps
     else:
         resolved = float(cfg.get("fps", 30.0))
-        print(f"WARNING: could not resolve FPS from video or pose3d_hand; using {resolved:.6g}")
+        logger.warning(f"could not resolve FPS from video or pose3d_hand; using {resolved:.6g}")
 
     cfg.fps = float(resolved)
     if "runtime" in cfg:
@@ -1350,7 +1362,7 @@ def ensure_keypoint_frames(cfg: DictConfig, profiler: StageProfiler | None = Non
         frame_opts["fps"] = fps
 
     image_root.mkdir(parents=True, exist_ok=True)
-    print(f"Extracting keypoint frames from {src_path} to {image_root} at {fps} fps")
+    logger.info(f"Extracting keypoint frames from {src_path} to {image_root} at {fps} fps")
     if profiler:
         profiler.record_value("keypoints", "frame_extraction_status", "extracted")
     with profiler.section("keypoints", "frame_extraction_sec") if profiler else nullcontext():
@@ -1362,6 +1374,25 @@ def ensure_keypoint_frames(cfg: DictConfig, profiler: StageProfiler | None = Non
 def make_body_model(cfg: DictConfig, batch_size: int, device: torch.device) -> MANO:
     mano_cfg = {k.lower(): v for k, v in dict(cfg.MANO).items()}
     return MANO(batch_size=batch_size, pose2rot=True, **mano_cfg).to(device)
+
+
+class BodyModelCache:
+    def __init__(self, cfg: DictConfig) -> None:
+        self.cfg = cfg
+        self._cache: dict[tuple[int, str, tuple[tuple[str, str], ...]], MANO] = {}
+
+    def _key(self, batch_size: int, device: torch.device) -> tuple[int, str, tuple[tuple[str, str], ...]]:
+        mano_cfg = tuple(sorted((str(k).lower(), repr(v)) for k, v in dict(self.cfg.MANO).items()))
+        return int(batch_size), str(device), mano_cfg
+
+    def get(self, batch_size: int, device: torch.device) -> MANO:
+        key = self._key(batch_size, device)
+        if key not in self._cache:
+            logger.info(f"Loading MANO body model: batch_size={batch_size}, device={device}")
+            self._cache[key] = make_body_model(self.cfg, batch_size, device)
+        else:
+            logger.info(f"Reusing MANO body model: batch_size={batch_size}, device={device}")
+        return self._cache[key]
 
 
 def stage_loss_weights(cfg: DictConfig) -> list[dict[str, float]]:
@@ -1376,6 +1407,7 @@ def run_root_or_smooth(
     frozen_init_latent_pose: torch.Tensor | None = None,
     pose_prior: Any | None = None,
     profiler: StageProfiler | None = None,
+    body_model_cache: BodyModelCache | None = None,
 ) -> Path:
     from optim.optimizers import RootOptimizer, SmoothOptimizer
 
@@ -1395,14 +1427,17 @@ def run_root_or_smooth(
             profiler.record_value(stage, "num_tracks", data.n_tracks)
             profiler.record_value(stage, "num_frames", data.T)
         if num_iters == 0:
-            Logger.log(f"Skipping {stage} optimization because num_iters=0")
+            logger.info(f"Skipping {stage} optimization because num_iters=0")
             with profiler.section(stage, "export_sec") if profiler else nullcontext():
                 return save_pose3d_payload(data.payload, output)
 
         with profiler.section(stage, "obs_build_sec", device=device) if profiler else nullcontext():
             obs_data = move_to(data.obs_data(), device)
         with profiler.section(stage, "body_model_init_sec", device=device) if profiler else nullcontext():
-            body_model = make_body_model(cfg, data.n_tracks * data.T, device)
+            if body_model_cache is None:
+                body_model = make_body_model(cfg, data.n_tracks * data.T, device)
+            else:
+                body_model = body_model_cache.get(data.n_tracks * data.T, device)
         with profiler.section(stage, "scene_model_init_sec", device=device) if profiler else nullcontext():
             model = make_model(cfg, body_model, data, device, pose_prior=pose_prior)
         all_loss_weights = stage_loss_weights(cfg)
@@ -1410,7 +1445,7 @@ def run_root_or_smooth(
         optimizer_cls = RootOptimizer if stage == "root" else SmoothOptimizer
         with profiler.section(stage, "optimizer_init_sec", device=device) if profiler else nullcontext():
             optimizer = optimizer_cls(model, all_loss_weights, **opt_kwargs)
-        Logger.log(f"Running {stage} for {num_iters} iterations")
+        logger.info(f"Running {stage} for {num_iters} iterations")
         with profiler.section(stage, "optimization_sec", device=device) if profiler else nullcontext():
             for i in range(num_iters):
                 optimizer.cur_step = i
@@ -1434,6 +1469,7 @@ def run_prior_stage(
     device: torch.device,
     frozen_init_latent_pose: torch.Tensor | None = None,
     profiler: StageProfiler | None = None,
+    body_model_cache: BodyModelCache | None = None,
 ) -> Path:
     from HMP.fitting import fitting_prior
 
@@ -1454,7 +1490,14 @@ def run_prior_stage(
             obs_data = move_to(data.obs_data(), device)
             res_dict = move_to(res_dict_from_payload(data.payload), device)
         with profiler.section("prior", "body_model_init_sec", device=device) if profiler else nullcontext():
-            body_model = make_body_model(cfg, data.n_tracks * data.T, device)
+            hand_parallel = bool(cfg.HMP.get("parallel", {}).get("hand", {}).get("enabled", False))
+            if hand_parallel:
+                logger.info("Skipping prior main-process MANO load because HMP hand parallel is enabled")
+                body_model = None
+            elif body_model_cache is None:
+                body_model = make_body_model(cfg, data.n_tracks * data.T, device)
+            else:
+                body_model = body_model_cache.get(data.n_tracks * data.T, device)
         cfg.paths.base_dir = str(_REPO_ROOT.resolve())
         cfg.HMP.exp_name = str(cfg.data.seq)
         cfg.HMP.resolved_fps = float(cfg.fps)
@@ -1521,26 +1564,27 @@ def run_from_cfg(cfg: DictConfig) -> Path:
         enabled=bool(profile_cfg.get("enabled", False)),
         include_iteration_samples=bool(profile_cfg.get("include_iteration_samples", False)),
     )
+    work_dir = resolve_path(cfg.data.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    configure_stage_logging(work_dir / "pose3d_hand_stages.log")
     with profiler.section([], "total_sec") if profiler.enabled else nullcontext():
         original_pose_path = resolve_path(cfg.data.pose3d_hand)
         with profiler.section("startup", "pose_payload_read_sec") if profiler.enabled else nullcontext():
             original_pose_payload = load_pose3d_payload(original_pose_path)
         with profiler.section("startup", "fps_resolve_sec") if profiler.enabled else nullcontext():
             resolved_fps = resolve_runtime_fps(cfg, original_pose_payload)
-        print(f"Using runtime FPS: {resolved_fps:.6g}")
+        logger.info(f"Using runtime FPS: {resolved_fps:.6g}")
         ensure_keypoint_frames(cfg, profiler=profiler)
-        work_dir = resolve_path(cfg.data.work_dir)
-        work_dir.mkdir(parents=True, exist_ok=True)
         with profiler.section("startup", "config_snapshot_sec") if profiler.enabled else nullcontext():
             snapshot_work_dir_config(cfg, work_dir)
-        Logger.init(str(work_dir / "pose3d_hand_stages.log"))
         with profiler.section("startup", "device_select_sec") if profiler.enabled else nullcontext():
             device = select_device(cfg)
+        body_model_cache = BodyModelCache(cfg)
         with profiler.section("startup", "pose_prior_load_sec", device=device) if profiler.enabled else nullcontext():
             pose_prior = load_pose_prior(cfg, device)
         with profiler.section("startup", "frozen_init_latent_pose_sec", device=device) if profiler.enabled else nullcontext():
             frozen_init_latent_pose = build_frozen_init_latent_pose(
-                cfg, device, original_pose_path, pose_prior
+                cfg, device, original_pose_path, pose_prior, body_model_cache=body_model_cache
             )
         stages = STAGE_ORDER if str(cfg.data.stage) == "all" else (str(cfg.data.stage),)
         keep_resume = bool(cfg.data.resume)
@@ -1548,7 +1592,7 @@ def run_from_cfg(cfg: DictConfig) -> Path:
         for stage in stages:
             existing = try_latest_stage_output(cfg, stage) if keep_resume else None
             if existing is not None:
-                Logger.log(f"resume: skip {stage}, use {existing}")
+                logger.info(f"resume: skip {stage}, use {existing}")
                 last_output = existing
                 if profiler.enabled:
                     profiler.record_value(stage, "resume_skipped", True)
@@ -1560,6 +1604,7 @@ def run_from_cfg(cfg: DictConfig) -> Path:
                     frozen_init_latent_pose=frozen_init_latent_pose,
                     pose_prior=pose_prior,
                     profiler=profiler,
+                    body_model_cache=body_model_cache,
                 )
             elif stage == "prior":
                 last_output = run_prior_stage(
@@ -1567,6 +1612,7 @@ def run_from_cfg(cfg: DictConfig) -> Path:
                     device,
                     frozen_init_latent_pose=frozen_init_latent_pose,
                     profiler=profiler,
+                    body_model_cache=body_model_cache,
                 )
             else:
                 raise ValueError(f"Unknown stage: {stage}")
@@ -1581,9 +1627,10 @@ def run_from_cfg(cfg: DictConfig) -> Path:
         profiler.write_json(profile_path)
         if bool(profile_cfg.get("print_summary", True)):
             for line in profiler.summary_lines():
-                Logger.log(line)
-        Logger.log(f"Saved profile to {profile_path}")
-    print(f"Saved final pose3d_hand to {final_output}")
+                logger.info(line)
+        logger.info(f"Saved profile to {profile_path}")
+    logger.info(f"Saved final pose3d_hand to {final_output}")
+    logger.complete()
     return final_output
 
 

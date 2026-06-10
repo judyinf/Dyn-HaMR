@@ -3,8 +3,10 @@ import cv2
 import copy
 import glob
 import json
+import sys
 import time
 import torch
+import multiprocessing as mp
 # import ffmpeg
 import joblib
 import random
@@ -77,6 +79,18 @@ def _cfg_get(cfg, key, default=None):
     if isinstance(cfg, dict):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
+
+
+def configure_worker_logging(log_path=None, level='INFO'):
+    logger.remove()
+    logger.add(sys.stdout, level=level, enqueue=True)
+    if log_path:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        logger.add(log_path, level=level, enqueue=True)
+
+
+def _process_pool(max_workers):
+    return ProcessPoolExecutor(max_workers=max_workers, mp_context=mp.get_context('spawn'))
 
 
 def _as_plain_config(value):
@@ -287,7 +301,7 @@ def get_stage2_res(base_dir, device, npz_init_dict, hand_model):
         gender = str(cdata['gender'], encoding='utf-8')
 
     N = len(cdata['poses'])
-    print(f'Sequence has {N} frames')
+    logger.info(f'Sequence has {N} frames')
     if N < 2:
         raise ValueError(f"HMP prior requires at least 2 frames, got {N}")
     temporal_keys = [
@@ -941,6 +955,7 @@ def _optimize_window_current_process(
 
 def _window_worker(job):
     global args
+    configure_worker_logging(job.get('log_path'))
     torch.manual_seed(0)
     np.random.seed(0)
     random.seed(0)
@@ -1139,6 +1154,7 @@ def _optimize_hand_current_process(
                 'valid_len': valid_len,
                 'window_dir': window_dir,
                 'hand_idx': hand_idx,
+                'log_path': os.path.join(args.save_path, 'hmp_workers.log'),
                 'window_meta': {
                     'window_idx': window_idx,
                     'start': start,
@@ -1171,7 +1187,7 @@ def _optimize_hand_current_process(
         logger.info(
             f'Running HMP hand {hand_idx} windows in parallel with {window_workers} workers'
         )
-        with ProcessPoolExecutor(max_workers=window_workers) as executor:
+        with _process_pool(window_workers) as executor:
             futures = {executor.submit(_window_worker, job): job['window_idx'] for job in window_jobs}
             for future in as_completed(futures):
                 hand_windows[futures[future]] = future.result()
@@ -1181,6 +1197,7 @@ def _optimize_hand_current_process(
 
 def _hand_worker(job):
     global args
+    configure_worker_logging(job.get('log_path'))
     torch.manual_seed(0)
     np.random.seed(0)
     random.seed(0)
@@ -1237,14 +1254,14 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
     os.makedirs(args.save_path, exist_ok=True)
     shutil.copy2(config_f, args.save_path)
 
-    print('loading data...')
+    logger.info('loading data...')
     assert len(res_dict) == 1
     res_dict = res_dict[0]
-    print('obs_data: ', obs_data.keys())
-    print('res_dict: ', res_dict.keys())
+    logger.info(f'obs_data: {obs_data.keys()}')
+    logger.info(f'res_dict: {res_dict.keys()}')
     for key in res_dict.keys():
         res_dict[key] = res_dict[key].cpu().detach().numpy()
-        print(key, res_dict[key].shape)
+        logger.info(f'{key} {res_dict[key].shape}')
 
     for key in obs_data.keys():
         try:
@@ -1270,7 +1287,7 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
         stitched_hands = [None] * n_hands
         hand_metadata_by_idx = [None] * n_hands
         opt_plain = _as_plain_config(opt)
-        with ProcessPoolExecutor(max_workers=hand_workers) as executor:
+        with _process_pool(hand_workers) as executor:
             futures = {}
             for hand_idx in range(n_hands):
                 seq_len = len(res_dict['trans'][hand_idx])
@@ -1291,6 +1308,7 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
                     'abs_video_path': abs_video_path,
                     'config_type': config_type,
                     'diagnostics_dir': diagnostics_dir,
+                    'log_path': os.path.join(args.save_path, 'hmp_workers.log'),
                     'profile': {
                         'enabled': _hmp_profile_enabled(),
                         'include_iteration_samples': bool(
@@ -1342,7 +1360,7 @@ def multi_stage_opt(opt, device, obs_data, res_dict, hand_model, config_f, exp_s
     )
 
     for key in res_dict.keys():
-        print(key, res_dict[key].shape)
+        logger.info(f'{key} {res_dict[key].shape}')
     np.savez(pred_save_path, **res_dict)
     return res_dict, pred_save_path
 
@@ -1738,7 +1756,7 @@ def optim_step_new(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
             logger.warning('Loss is NaN, skipping this stage')
             raise ValueError
 
-        print(stg_id, i, stg_conf.niters)
+        logger.info(f'{stg_id} {i} {stg_conf.niters}')
         loss_log_str = f'Stage {stg_id+1} [{i:03d}/{stg_conf.niters}]'
         for k, v in loss_dict.items():
             loss_dict[k] = v.item()
@@ -1787,7 +1805,7 @@ def optim_step_new(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
     
     # optimize the z_l and root_orient, pos, trans, 2d kp objectives
     start_time = time.time()
-    print('start latent optimization...')
+    logger.info('start latent optimization...')
     for i in range(stg_conf.niters):
         optimizer.step(closure)
         
@@ -1796,7 +1814,7 @@ def optim_step_new(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
     # save the loss dict. 
     joblib.dump(loss_dict_by_step, open(os.path.join(args.pkl_output_dir, f'stage_{stg_id}_loss.pkl'), 'wb'))
     
-    print(f'Stage {stg_id+1} finished in {time.strftime("%H:%M:%S", time.gmtime(end_time - start_time))}')
+    logger.info(f'Stage {stg_id+1} finished in {time.strftime("%H:%M:%S", time.gmtime(end_time - start_time))}')
     
     if not betas is None:
         logger.info(f'mean_betas: {mean_betas.detach().cpu().numpy()}')
@@ -1843,7 +1861,7 @@ def optim_step(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
     
     # optimize the z_l and root_orient, pos, trans, 2d kp objectives
     start_time = time.time()
-    print(f'start latent optimization... {stg_conf.niters} iters')
+    logger.info(f'start latent optimization... {stg_conf.niters} iters')
     iter_samples = []
     for i in range(stg_conf.niters):
         _hmp_profile_sync()
@@ -2065,7 +2083,7 @@ def optim_step(hand_model, stg_conf, stg_id, z_l, z_g, betas, target, B,
     # save the loss dict. 
     joblib.dump(loss_dict_by_step, open(os.path.join(args.pkl_output_dir, f'stage_{stg_id}_loss.pkl'), 'wb'))
     
-    print(f'Stage {stg_id+1} finished in {time.strftime("%H:%M:%S", time.gmtime(end_time - start_time))}')
+    logger.info(f'Stage {stg_id+1} finished in {time.strftime("%H:%M:%S", time.gmtime(end_time - start_time))}')
     
     if not betas is None:
         logger.info(f'mean_betas: {mean_betas.detach().cpu().numpy()}')
@@ -2172,7 +2190,7 @@ def run_prior(
         returns a dict of iter to result path
         """
         res_files = sorted(glob.glob(f"{res_dir}/*_results.npz"))
-        print(f"found {len(res_files)} results in {res_dir}")
+        logger.info(f"found {len(res_files)} results in {res_dir}")
 
         path_dict = {}
         for res_file in res_files:
@@ -2184,10 +2202,10 @@ def run_prior(
         return path_dict
 
     save_dir = out_dir if save_dir is None else save_dir
-    print("OUT_DIR", out_dir)
-    print("SAVE_DIR", save_dir)
-    print("VISUALIZING PHASES", phases)
-    print("PRIOR OUT", prior_out)
+    logger.info(f"OUT_DIR {out_dir}")
+    logger.info(f"SAVE_DIR {save_dir}")
+    logger.info(f"VISUALIZING PHASES {phases}")
+    logger.info(f"PRIOR OUT {prior_out}")
 
     phase_results = {}
     phase_max_iters = {}
@@ -2203,7 +2221,7 @@ def run_prior(
             res = load_result(res_path_dict[it])["world"]
 
         else:
-            print(f"{res_dir} does not exist, skipping")
+            logger.info(f"{res_dir} does not exist, skipping")
             continue
 
         out_name = f"{save_dir}/{dataset.seq_name}_{phase}_final_{it}"
