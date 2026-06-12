@@ -4,6 +4,8 @@ bvh_viz: false
 data:
   clip_length: 128
   fps: 30
+  available_fps:
+  - 30
   gender: neutral
   normalize:
   - pos

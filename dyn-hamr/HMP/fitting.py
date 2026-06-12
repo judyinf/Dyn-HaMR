@@ -128,29 +128,73 @@ def _device_for_job(devices, index, fallback):
     return _available_device_name(devices[index % len(devices)])
 
 
-def _normalize_hmp_fps_for_stats(args):
-    fps = float(args.data.fps)
+def _format_hmp_fps(fps):
+    fps = float(fps)
     rounded = int(round(fps))
     if abs(fps - rounded) < 1e-4:
-        args.data.fps = rounded
+        return str(rounded)
+    return f'{fps:g}'
+
+
+def _coerce_hmp_fps_value(fps):
+    fps = float(fps)
+    rounded = int(round(fps))
+    return rounded if abs(fps - rounded) < 1e-4 else fps
+
+
+def _hmp_stats_paths(args, fps):
+    fps_str = _format_hmp_fps(fps)
+    prefix = f'{args.data.gender}-{args.data.clip_length}-{fps_str}fps.pt'
+    return (
+        os.path.join(args.dataset_dir, f'mean-{prefix}'),
+        os.path.join(args.dataset_dir, f'std-{prefix}'),
+    )
+
+
+def _hmp_stats_pair_exists(args, fps):
+    mean_path, std_path = _hmp_stats_paths(args, fps)
+    return os.path.isfile(mean_path) and os.path.isfile(std_path)
+
+
+def _normalize_hmp_fps_for_stats(args):
+    fps = float(args.data.fps)
+    if _hmp_stats_pair_exists(args, fps):
+        args.data.fps = _coerce_hmp_fps_value(fps)
         return
 
-    mean_path = os.path.join(
-        args.dataset_dir,
-        f'mean-{args.data.gender}-{args.data.clip_length}-{args.data.fps}fps.pt',
-    )
-    if os.path.isfile(mean_path):
-        return
+    available_fps = getattr(args.data, 'available_fps', [])
+    available_pairs = [
+        float(candidate)
+        for candidate in available_fps
+        if _hmp_stats_pair_exists(args, candidate)
+    ]
+    if available_pairs:
+        nearest = min(available_pairs, key=lambda candidate: abs(candidate - fps))
+        delta = abs(nearest - fps)
+        if delta <= 1.0:
+            logger.warning(
+                f'HMP stats for {fps:g}fps not found; using nearest available stats '
+                f'{_format_hmp_fps(nearest)}fps (delta={delta:.3g})'
+            )
+            args.data.fps = _coerce_hmp_fps_value(nearest)
+            return
 
-    rounded_mean_path = os.path.join(
-        args.dataset_dir,
-        f'mean-{args.data.gender}-{args.data.clip_length}-{rounded}fps.pt',
-    )
-    if os.path.isfile(rounded_mean_path):
-        logger.warning(
-            f'HMP stats for {fps:.6g}fps not found; using nearest integer stats {rounded}fps'
+    mean_path, std_path = _hmp_stats_paths(args, fps)
+    if not available_fps:
+        available_msg = 'none configured'
+    elif available_pairs:
+        available_msg = ', '.join(f'{_format_hmp_fps(v)}fps' for v in sorted(available_pairs))
+    else:
+        available_msg = (
+            'configured but missing mean/std pairs: '
+            + ', '.join(f'{_format_hmp_fps(v)}fps' for v in available_fps)
         )
-        args.data.fps = rounded
+    raise FileNotFoundError(
+        f'HMP stats for {fps:g}fps not found and no configured available fps within 1fps. '
+        f'Expected mean/std files: {mean_path}, {std_path}. '
+        f'Available fps in config with complete files: {available_msg}. '
+        f'dataset_dir={args.dataset_dir}'
+    )
 
 
 def _configure_hmp_args(base_dir, hmp_config, save_path, vid_path, dataname, resolved_fps=None):
