@@ -89,14 +89,16 @@ runtime:
   # 当前 stage runner 使用：控制 profile.json 输出与迭代耗时采样。
   profile:
     enabled: true
-    output: ../outputs/logs/profile_${data.name}.json
+    output: ../outputs/logs/profile_${data.name}_${run_id}.json
     print_summary: false
     include_iteration_samples: false
 
 fps: 30
 log_root: ../outputs/logs
 log_dir: ${log_root}/${data.type}-${data.split}
-exp_name: ${now:%Y-%m-%d}
+# 统一运行 ID：用于 Hydra run dir、stage work_dir 和 profile，避免多次运行覆盖。
+run_id: ${now:%Y-%m-%d_%H-%M-%S}
+exp_name: ${run_id}
 # 旧 run_vis.py 字段；当前 stage runner 不直接渲染可视化。
 temporal_smooth: True
 # 当前 stage runner 使用：当 runtime.devices.* 和 data.device_override 都未设置时，默认 device 为 cuda:${gpu}。

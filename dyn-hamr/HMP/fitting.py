@@ -188,8 +188,8 @@ def _init_hmp_model(device_name):
     model = Architecture(args, ngpu)
     model.load(optimal=True)
     model.eval()
-    fk = ForwardKinematicsLayer(args)
     device = torch.device(device_name)
+    fk = ForwardKinematicsLayer(args, device=device)
     bmc.to(device)
     return device
 def run_mano(body_model, trans, root_orient, body_pose, is_right, betas=None, only_right=False):
@@ -292,8 +292,9 @@ def reproject(points3d, cam_R, cam_t, cam_f, cam_center):
 def get_stage2_res(base_dir, device, npz_init_dict, hand_model):
     args = Arguments(base_dir, os.path.dirname(__file__), filename='amass.yaml')
     # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device(device)
     
-    fk = ForwardKinematicsLayer(args)
+    fk = ForwardKinematicsLayer(args, device=device)
     to_th = lambda x: torch.from_numpy(x).to(device)
     
     cdata = npz_init_dict

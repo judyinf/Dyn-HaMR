@@ -8,7 +8,7 @@ src_path: ${data.root}/${data.video_dir}/${data.seq}.${data.ext}
 
 # Three-stage pose3d_hand runner options.
 stage: all
-work_dir: ../outputs/pose3d_hand_stages/${data.seq}
+work_dir: ../outputs/pose3d_hand_stages/${data.seq}_${run_id}
 output: ../demo/${data.seq}_export.pose3d_hand
 pose3d_hand: ../demo/${data.seq}.compat.pose3d_hand
 track_info: ../demo/${data.seq}_track_info.compat.npy
