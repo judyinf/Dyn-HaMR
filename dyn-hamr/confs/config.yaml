@@ -4,17 +4,28 @@ defaults:
   - _self_
 
 model:
+  # 兼容旧 run_opt/BaseSceneModel 初始化路径；run_pose3d_hand_stages.py 构建模型时固定 use_init=False。
   use_init: True
+  # 当前 stage runner 使用：True 时加载 paths.vposer 并把初始 MANO pose 编码成 latent pose。
   use_vposer: False
+  # 当前 stage runner 启动时会强制设为 False；相机来自 pose3d_hand.slam_data，不在 root/smooth 中优化。
   opt_cams: False #True
+  # 当前 stage runner 使用：控制 root/smooth scene model 是否优化 world scale。
   opt_scale: True
+  # 旧 MovingSceneModel 字段：处理不同 track 起止帧不同步的情况；当前 stage runner 使用 BaseSceneModel，不读取该字段。
   async_tracks: True
 
+# 旧 pipeline/preproc 兼容字段；run_pose3d_hand_stages.py 不读取。
 overwrite: False
+# 旧 run_opt.py 开关；run_pose3d_hand_stages.py 启动时会强制设为 False。
 run_opt: True
+# 旧 run_opt.py/run_vis.py 开关；run_pose3d_hand_stages.py 启动时会强制设为 False。
 run_vis: True
+# 旧 run_opt.py prior 开关；当前 stage runner 用 data.stage=prior/all 控制 prior 阶段。
 run_prior: False
+# 旧 dataset/preproc 兼容字段。
 datatype: ${data.type}
+# 当前 stage runner 不执行可视化；本块主要供旧 run_vis.py 使用。
 vis:
   phases:
     # - motion_chunks
@@ -45,27 +56,37 @@ paths:
   vposer: VPoser/pretrained/Vposer_right_mirrored # _DATA/body_models/vposer_v1_0
 
 HMP:
+  # 当前 prior 阶段使用：HMP/ 下的内部配置文件名。
   config: hmp_config.yaml
+  # 当前 fitting_prior() 会强制关闭；启用 hposer 的 pose prior 分支尚未实现。
   use_hposer: False
+  # 当前 prior 阶段使用：传给 HMP 的图片/视频路径。
   vid_path: ${data.sources.images}
+  # 运行时由 stage runner 写入 data.seq。
   exp_name: None
+  # 运行时由 stage runner 写入解析后的 fps。
   resolved_fps: null
+  # 当前 prior 阶段使用：控制 HMP 按手/按 window 并行的 worker 数和设备分配。
   parallel:
     hand:
       enabled: true
       workers: 2
       devices:
-        - cuda:0
+        - cuda:3
     window:
       enabled: true
       workers_per_hand: 4
       devices:
-        - cuda:0
+        - cuda:3
 
 runtime:
+  # 当前 stage runner 使用：只支持 auto，会从视频或 pose3d_hand 中解析 fps。
   fps: auto
+  # 当前 stage runner 使用：视频 fps 与 pose3d_hand fps 的允许误差。
   fps_tolerance: 0.5
+  # 运行时由 stage runner 写入最终 fps。
   resolved_fps: null
+  # 当前 stage runner 使用：控制 profile.json 输出与迭代耗时采样。
   profile:
     enabled: true
     output: ../outputs/logs/profile_${data.name}.json
@@ -76,8 +97,11 @@ fps: 30
 log_root: ../outputs/logs
 log_dir: ${log_root}/${data.type}-${data.split}
 exp_name: ${now:%Y-%m-%d}
+# 旧 run_vis.py 字段；当前 stage runner 不直接渲染可视化。
 temporal_smooth: True
+# 当前 stage runner 使用：当 runtime.devices.* 和 data.device_override 都未设置时，默认 device 为 cuda:${gpu}。
 gpu: 0
+# 旧 dataset/camera 字段；当前 stage runner 从 pose3d_hand.slam_data 读取相机。
 is_static: False
 
 hydra:

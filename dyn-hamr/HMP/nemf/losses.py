@@ -64,13 +64,9 @@ def compute_geodesic_distance(m1, m2):
     Returns:
         The minimal angular difference between two rotation matrices in radian form [0, pi].
     """
-    batch = m1.shape[:-2]
     m = torch.matmul(m1, m2.transpose(-2, -1))  # batch*3*3
 
     cos = (m[..., 0, 0] + m[..., 1, 1] + m[..., 2, 2] - 1) / 2
-    cos = torch.min(cos, torch.ones(*batch).cuda())
-    cos = torch.max(cos, torch.ones(*batch).cuda() * -1)
-    
     eps = 1e-7
     cos = torch.clamp(cos, -1 + eps, 1 - eps)
         
@@ -85,4 +81,3 @@ def rot_smooth_loss(rotmat):
     loss = vel ** 2
     loss = 0.5 * torch.mean(loss)
     return loss
-

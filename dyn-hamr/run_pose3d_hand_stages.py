@@ -51,7 +51,8 @@ class StageProfiler:
     def __init__(self, enabled: bool = False, include_iteration_samples: bool = False) -> None:
         self.enabled = enabled
         self.include_iteration_samples = include_iteration_samples
-        self.data: dict[str, Any] = {"total_sec": 0.0, "stages": {}}
+        self.data: dict[str, Any] = {"status": "running", "total_sec": 0.0, "stages": {}}
+        self.output_path: Path | None = None
 
     @staticmethod
     def _sync(device: torch.device | None = None) -> None:
@@ -90,6 +91,23 @@ class StageProfiler:
             node[key] = float(node.get(key, 0.0) + elapsed)
             if metadata:
                 node.setdefault("metadata", {}).update(metadata)
+            self.flush()
+
+    def set_output(self, path: Path) -> None:
+        self.output_path = path
+
+    def flush(self) -> None:
+        if not self.enabled or self.output_path is None:
+            return
+        self.write_json(self.output_path)
+
+    def mark_failed(self, exc: BaseException) -> None:
+        if not self.enabled:
+            return
+        self.data["status"] = "failed"
+        self.data["error_type"] = type(exc).__name__
+        self.data["error"] = str(exc)
+        self.flush()
 
     def record_value(self, path: str | list[str], key: str, value: Any) -> None:
         if not self.enabled:
@@ -121,8 +139,10 @@ class StageProfiler:
         if not self.enabled:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as f:
+        tmp_path = path.with_name(path.name + ".tmp")
+        with open(tmp_path, "w") as f:
             json.dump(self.data, f, indent=2)
+        tmp_path.replace(path)
 
     def summary_lines(self) -> list[str]:
         if not self.enabled:
@@ -1186,9 +1206,7 @@ def make_stage_data(
     frozen_init_latent_pose: torch.Tensor | None = None,
     profiler: StageProfiler | None = None,
 ) -> Pose3DHandStageData:
-    vitpose_device = cfg.data.get("device_override", None)
-    if vitpose_device is None:
-        vitpose_device = f"cuda:{cfg.gpu}" if torch.cuda.is_available() else "cpu"
+    vitpose_device = resolve_stage_device(cfg, "vitpose")
     return Pose3DHandStageData(
         pose_path=stage_input(cfg, stage),
         track_info_path=resolve_path(cfg.data.track_info),
@@ -1456,6 +1474,10 @@ def run_root_or_smooth(
                 StageProfiler._sync(device)
                 if profiler:
                     profiler.record_iteration(stage, time.perf_counter() - iter_start)
+                    profile_cfg = cfg.runtime.get("profile", {}) if "runtime" in cfg else {}
+                    flush_every = max(1, int(profile_cfg.get("flush_every", 10)))
+                    if (i + 1) % flush_every == 0:
+                        profiler.flush()
         optimizer.cur_step = num_iters
         with profiler.section(stage, "export_sec", device=device) if profiler else nullcontext():
             payload = payload_from_model(data.payload, model)
@@ -1546,15 +1568,31 @@ def copy_final(src: Path, dst: Path) -> Path:
     return dst
 
 
-def select_device(cfg: DictConfig) -> torch.device:
-    override = cfg.data.get("device_override", None)
-    if override is not None:
-        device_name = str(override)
-    else:
-        device_name = f"cuda:{cfg.gpu}"
+def _available_torch_device(device_name: str) -> torch.device:
     if device_name.startswith("cuda") and not torch.cuda.is_available():
         device_name = "cpu"
     return torch.device(device_name)
+
+
+def resolve_stage_device(cfg: DictConfig, stage: str = "default") -> torch.device:
+    if stage not in {"default", "vitpose", "root", "smooth", "prior"}:
+        raise ValueError(f"Unknown runtime device stage: {stage}")
+    runtime_cfg = cfg.get("runtime", {}) if "runtime" in cfg else {}
+    devices_cfg = runtime_cfg.get("devices", {}) if runtime_cfg is not None else {}
+    device_name = None
+    if devices_cfg is not None:
+        device_name = devices_cfg.get(stage, None)
+        if device_name is None and stage != "default":
+            device_name = devices_cfg.get("default", None)
+    if device_name is None:
+        device_name = cfg.data.get("device_override", None)
+    if device_name is None:
+        device_name = f"cuda:{cfg.gpu}"
+    return _available_torch_device(str(device_name))
+
+
+def select_device(cfg: DictConfig) -> torch.device:
+    return resolve_stage_device(cfg, "default")
 
 
 def run_from_cfg(cfg: DictConfig) -> Path:
@@ -1567,71 +1605,84 @@ def run_from_cfg(cfg: DictConfig) -> Path:
     work_dir = resolve_path(cfg.data.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     configure_stage_logging(work_dir / "pose3d_hand_stages.log")
-    with profiler.section([], "total_sec") if profiler.enabled else nullcontext():
-        original_pose_path = resolve_path(cfg.data.pose3d_hand)
-        with profiler.section("startup", "pose_payload_read_sec") if profiler.enabled else nullcontext():
-            original_pose_payload = load_pose3d_payload(original_pose_path)
-        with profiler.section("startup", "fps_resolve_sec") if profiler.enabled else nullcontext():
-            resolved_fps = resolve_runtime_fps(cfg, original_pose_payload)
-        logger.info(f"Using runtime FPS: {resolved_fps:.6g}")
-        ensure_keypoint_frames(cfg, profiler=profiler)
-        with profiler.section("startup", "config_snapshot_sec") if profiler.enabled else nullcontext():
-            snapshot_work_dir_config(cfg, work_dir)
-        with profiler.section("startup", "device_select_sec") if profiler.enabled else nullcontext():
-            device = select_device(cfg)
-        body_model_cache = BodyModelCache(cfg)
-        with profiler.section("startup", "pose_prior_load_sec", device=device) if profiler.enabled else nullcontext():
-            pose_prior = load_pose_prior(cfg, device)
-        with profiler.section("startup", "frozen_init_latent_pose_sec", device=device) if profiler.enabled else nullcontext():
-            frozen_init_latent_pose = build_frozen_init_latent_pose(
-                cfg, device, original_pose_path, pose_prior, body_model_cache=body_model_cache
-            )
-        stages = STAGE_ORDER if str(cfg.data.stage) == "all" else (str(cfg.data.stage),)
-        keep_resume = bool(cfg.data.resume)
-        last_output = original_pose_path
-        for stage in stages:
-            existing = try_latest_stage_output(cfg, stage) if keep_resume else None
-            if existing is not None:
-                logger.info(f"resume: skip {stage}, use {existing}")
-                last_output = existing
-                if profiler.enabled:
-                    profiler.record_value(stage, "resume_skipped", True)
-            elif stage in {"root", "smooth"}:
-                last_output = run_root_or_smooth(
-                    cfg,
-                    stage,
-                    device,
-                    frozen_init_latent_pose=frozen_init_latent_pose,
-                    pose_prior=pose_prior,
-                    profiler=profiler,
-                    body_model_cache=body_model_cache,
-                )
-            elif stage == "prior":
-                last_output = run_prior_stage(
-                    cfg,
-                    device,
-                    frozen_init_latent_pose=frozen_init_latent_pose,
-                    profiler=profiler,
-                    body_model_cache=body_model_cache,
-                )
-            else:
-                raise ValueError(f"Unknown stage: {stage}")
-            cfg.data.pose3d_hand = str(last_output)
-            if not keep_resume:
-                cfg.data.resume = False
-        with profiler.section("finalize", "copy_final_sec") if profiler.enabled else nullcontext():
-            final_output = copy_final(last_output, resolve_path(cfg.data.output))
     if profiler.enabled:
         profile_output = profile_cfg.get("output", None)
         profile_path = resolve_path(profile_output) if profile_output else resolve_path(cfg.data.work_dir) / "profile.json"
-        profiler.write_json(profile_path)
-        if bool(profile_cfg.get("print_summary", True)):
-            for line in profiler.summary_lines():
-                logger.info(line)
-        logger.info(f"Saved profile to {profile_path}")
-    logger.info(f"Saved final pose3d_hand to {final_output}")
-    logger.complete()
-    return final_output
+        profiler.set_output(profile_path)
+        profiler.flush()
+    try:
+        with profiler.section([], "total_sec") if profiler.enabled else nullcontext():
+            original_pose_path = resolve_path(cfg.data.pose3d_hand)
+            with profiler.section("startup", "pose_payload_read_sec") if profiler.enabled else nullcontext():
+                original_pose_payload = load_pose3d_payload(original_pose_path)
+            with profiler.section("startup", "fps_resolve_sec") if profiler.enabled else nullcontext():
+                resolved_fps = resolve_runtime_fps(cfg, original_pose_payload)
+            logger.info(f"Using runtime FPS: {resolved_fps:.6g}")
+            ensure_keypoint_frames(cfg, profiler=profiler)
+            profiler.flush()
+            with profiler.section("startup", "config_snapshot_sec") if profiler.enabled else nullcontext():
+                snapshot_work_dir_config(cfg, work_dir)
+            with profiler.section("startup", "device_select_sec") if profiler.enabled else nullcontext():
+                startup_device = resolve_stage_device(cfg, "root")
+            body_model_cache = BodyModelCache(cfg)
+            with profiler.section("startup", "pose_prior_load_sec", device=startup_device) if profiler.enabled else nullcontext():
+                pose_prior = load_pose_prior(cfg, startup_device)
+            with profiler.section("startup", "frozen_init_latent_pose_sec", device=startup_device) if profiler.enabled else nullcontext():
+                frozen_init_latent_pose = build_frozen_init_latent_pose(
+                    cfg, startup_device, original_pose_path, pose_prior, body_model_cache=body_model_cache
+                )
+            stages = STAGE_ORDER if str(cfg.data.stage) == "all" else (str(cfg.data.stage),)
+            keep_resume = bool(cfg.data.resume)
+            last_output = original_pose_path
+            for stage in stages:
+                stage_device = resolve_stage_device(cfg, stage)
+                logger.info(f"Using device {stage_device} for {stage}")
+                existing = try_latest_stage_output(cfg, stage) if keep_resume else None
+                if existing is not None:
+                    logger.info(f"resume: skip {stage}, use {existing}")
+                    last_output = existing
+                    if profiler.enabled:
+                        profiler.record_value(stage, "resume_skipped", True)
+                        profiler.flush()
+                elif stage in {"root", "smooth"}:
+                    last_output = run_root_or_smooth(
+                        cfg,
+                        stage,
+                        stage_device,
+                        frozen_init_latent_pose=frozen_init_latent_pose,
+                        pose_prior=pose_prior,
+                        profiler=profiler,
+                        body_model_cache=body_model_cache,
+                    )
+                elif stage == "prior":
+                    last_output = run_prior_stage(
+                        cfg,
+                        stage_device,
+                        frozen_init_latent_pose=frozen_init_latent_pose,
+                        profiler=profiler,
+                        body_model_cache=body_model_cache,
+                    )
+                else:
+                    raise ValueError(f"Unknown stage: {stage}")
+                cfg.data.pose3d_hand = str(last_output)
+                if not keep_resume:
+                    cfg.data.resume = False
+            with profiler.section("finalize", "copy_final_sec") if profiler.enabled else nullcontext():
+                final_output = copy_final(last_output, resolve_path(cfg.data.output))
+        if profiler.enabled:
+            profiler.data["status"] = "completed"
+            profiler.flush()
+            if bool(profile_cfg.get("print_summary", True)):
+                for line in profiler.summary_lines():
+                    logger.info(line)
+            logger.info(f"Saved profile to {profiler.output_path}")
+        logger.info(f"Saved final pose3d_hand to {final_output}")
+        return final_output
+    except Exception as exc:
+        profiler.mark_failed(exc)
+        raise
+    finally:
+        logger.complete()
 
 
 @hydra.main(version_base=None, config_path="confs", config_name="config.yaml")

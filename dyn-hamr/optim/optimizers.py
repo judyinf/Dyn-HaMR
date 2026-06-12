@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from loguru import logger
 
 from body_model import OP_IGNORE_JOINTS
 from geometry.mesh import save_mesh_scenes, vertices_to_trimesh
@@ -104,11 +105,11 @@ class StageOptimizer(object):
         param_path = os.path.join(out_dir, f"{self.name}_params.pth")
         param_dict = self.model.params.get_dict()
         if "world_scale" in param_dict:
-            print("WORLD_SCALE", param_dict["world_scale"].detach().cpu())
+            logger.debug(f"WORLD_SCALE {param_dict['world_scale'].detach().cpu()}")
         if "floor_plane" in param_dict:
-            print("FLOOR PLANE", param_dict["floor_plane"].detach().cpu())
+            logger.debug(f"FLOOR PLANE {param_dict['floor_plane'].detach().cpu()}")
         if "cam_f" in param_dict:
-            print("CAM_F", param_dict["cam_f"].detach().cpu())
+            logger.debug(f"CAM_F {param_dict['cam_f'].detach().cpu()}")
         torch.save(param_dict, param_path)
         Logger.log(f"Model saved at {param_path}")
 
@@ -127,18 +128,18 @@ class StageOptimizer(object):
         os.makedirs(out_dir, exist_ok=True)
 
         with torch.no_grad():
-            print('go into get_optim_result from optimizer.py save_results')
+            logger.debug("Collecting optimizer results for save_results")
             pred_dict = self.model.get_optim_result()
         pred_dict = move_to(detach_all(pred_dict), "cpu")
 
         i = self.cur_step
         for name, results in pred_dict.items():
-            print('save_results, name: ', name)
+            logger.debug(f"save_results name={name}")
             # save parameters of trajectory
             out_path = f"{out_dir}/{seq_name}_{i:06d}_{name}_results.npz"
             Logger.log(f"saving params to {out_path}")
             np.savez(out_path, **results)
-            print('cam_R in save_results and its .npz', results['cam_R'])
+            logger.debug(f"cam_R in save_results: {results['cam_R']}")
 
         # also save the cameras
         # print('save the cameras in ptimizer.py save_results')
@@ -220,7 +221,7 @@ class StageOptimizer(object):
         seq_name = obs_data["seq_name"][0]
         res_pre = f"{res_dir}/{seq_name}_opt_{self.cur_step:06d}"
         with torch.no_grad():
-            print('go into get_optim_result from optimizer.py vis_result')
+            logger.debug("Collecting optimizer results for vis_result")
             pred_dict = self.model.get_optim_result(num_steps=num_steps)
 
         res_dict = detach_all(pred_dict["world"])
@@ -280,7 +281,7 @@ class StageOptimizer(object):
         res_dir = os.path.join(out_dir, self.name)
         os.makedirs(res_dir, exist_ok=True)
         seq_name = obs_data["seq_name"][0]
-        print("SEQ NAME", seq_name, "num_iters", num_iters)
+        logger.info(f"SEQ NAME {seq_name} num_iters {num_iters}")
 
         # try to load from checkpoint if exists
         device = obs_data["joints2d"].device
@@ -295,7 +296,7 @@ class StageOptimizer(object):
         # time.sleep(5)
 
         # save initial results and vis
-        print('go into save_results in optimizers.py run()')
+        logger.debug("Saving initial optimizer results")
         self.save_results(res_dir, seq_name)
 
         for i in range(self.cur_step, num_iters):
@@ -320,7 +321,7 @@ class StageOptimizer(object):
             if np.isnan(self.cur_loss):
                 # we need to backtrack
                 self.load_checkpoint(out_dir, device=device)
-                print(self.cur_loss, self.kkk, self.ppp)
+                logger.warning(f"NaN loss encountered: {self.cur_loss}, {self.kkk}, {self.ppp}")
                 raise ValueError
 
             # termination for the last chunk
@@ -366,7 +367,7 @@ class StageOptimizer(object):
                     self.cur_loss
                     - 0.04 * stats_dict["pose_prior"].detach().cpu().item()
                 )
-            print("optimizer print", loss, loss.shape, stats_dict, loss.requires_grad)
+            logger.debug(f"optimizer loss={loss} shape={loss.shape} stats={stats_dict} requires_grad={loss.requires_grad}")
             loss.backward()
             # print('end of loss backward')
             return loss

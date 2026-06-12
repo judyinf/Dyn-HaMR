@@ -176,7 +176,7 @@ def _configure_hmp_args(base_dir, hmp_config, save_path, vid_path, dataname, res
 
 
 def _init_hmp_model(device_name):
-    global model, fk, ngpu
+    global model, fk, ngpu, bmc
     ngpu = 1
     device_name = _available_device_name(device_name)
     if str(device_name).startswith("cuda") and torch.cuda.is_available():
@@ -189,7 +189,9 @@ def _init_hmp_model(device_name):
     model.load(optimal=True)
     model.eval()
     fk = ForwardKinematicsLayer(args)
-    return torch.device(device_name)
+    device = torch.device(device_name)
+    bmc.to(device)
+    return device
 def run_mano(body_model, trans, root_orient, body_pose, is_right, betas=None, only_right=False):
     """
     Forward pass of the MANO model and populates pred_data accordingly with
@@ -551,8 +553,8 @@ def L_GMM(pose):
         loss_i = gmm_aa.log_likelihood(pose_aa_local[i, :, 1:].reshape(1, -1).cpu())
         loss_tot += loss_i
         
-    mp_loss = loss_tot / bs     
-    return mp_loss.to("cuda")
+    mp_loss = loss_tot / bs
+    return mp_loss.to(device=pose.device, dtype=pose.dtype)
 
 def L_orient(source, target, T, bbox_conf=None):
     """

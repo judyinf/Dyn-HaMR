@@ -60,18 +60,19 @@ def convert_pred_to_full_img_cam(pare_cam, bbox_height, bbox_center,
 #     return np.array([0, 13, 14, 15, 16, 1, 2, 3, 17, 4, 5, 6, 18, 10, 11, 12, 19, 7, 8, 9, 20], dtype=np.int32)
 
 def forward_mano_pymafx(output):
-    root_orient = output['root_orient'].to("cuda")  # (T, 3)
-    poses = output['poses'].to("cuda")  # (T, J, 3)
+    device = output['root_orient'].device
+    root_orient = output['root_orient'].to(device)  # (T, 3)
+    poses = output['poses'].to(device)  # (T, J, 3)
     
     T, J, _ = poses.size()
 
-    hand_model = MANO(model_path=MANO_RH_DIR, flat_hand_mean=True, use_pca=False, batch_size=poses.shape[0]).to('cuda')
+    hand_model = MANO(model_path=MANO_RH_DIR, flat_hand_mean=True, use_pca=False, batch_size=poses.shape[0]).to(device)
 
-    mano_out = hand_model(betas=output['betas'].view(-1, 10).to("cuda"),
-                            global_orient=root_orient.to("cuda"),
-                            hand_pose=poses.view(-1, 45).to("cuda"),
+    mano_out = hand_model(betas=output['betas'].view(-1, 10).to(device),
+                            global_orient=root_orient.to(device),
+                            hand_pose=poses.view(-1, 45).to(device),
                             return_tips=True,
-                            transl=output['trans'].view(-1, 3).to("cuda"))  
+                            transl=output['trans'].view(-1, 3).to(device))
         
     # mano_out.vertices -= RIGHT_WRIST_BASE_LOC.to(mano_out.vertices)
     # mano_out.joints -= RIGHT_WRIST_BASE_LOC.to(mano_out.joints)
@@ -801,28 +802,28 @@ def save_quantitative_evaluation(evaluator_object, pred_dict, pymafx_dict, gt_di
  
 
     if not os.path.isfile(performance_sequence):
-        print("Creating new performance file")
+        logger.info("Creating new performance file")
         joblib.dump({cfg_name: {}, "pymafx": {}}, performance_sequence)
         
     if not os.path.isfile(performance_per_frame):
-        print("Creating new performance file")
+        logger.info("Creating new performance file")
         joblib.dump({cfg_name: {}, "pymafx": {}}, performance_per_frame)
         
-    print("===================HMP====================="	)
+    logger.info("===================HMP=====================")
     for metric_name, metric_val in hmp_quant_metric_vals.items():
         if metric_name != "valid_frames":    
             # take mean over joints. 
             hmp_quant_metric_vals[metric_name] = metric_val.mean(axis=1)   
-            print(metric_name, "(mm): ", f"{metric_val.mean():.3f}")
+            logger.info(f"{metric_name} (mm): {metric_val.mean():.3f}")
             
     if not pymafx_quant_metric_vals is None:
-        print("==================PYMAFX==================="	)
+        logger.info("==================PYMAFX===================")
         for metric_name, pymafx_metric_val in pymafx_quant_metric_vals.items():    
             if metric_name != "valid_frames":    
                 pymafx_quant_metric_vals[metric_name] = pymafx_metric_val.mean(axis=1)  
-                print(metric_name, "(mm): ", f"{pymafx_metric_val.mean():.3f}")
+                logger.info(f"{metric_name} (mm): {pymafx_metric_val.mean():.3f}")
         
-    print("==========================================="	)  
+    logger.info("===========================================")
    
     with open(performance_per_frame, "rb") as f:
         perframe_pkl_file = joblib.load(f)
@@ -940,7 +941,7 @@ def calculate_joint_angle_loss(thetas, hulls):
 
     '''
 
-    loss = torch.Tensor([0]).cuda()
+    loss = thetas.new_zeros(1)
     for i in range(15):
         # print("i=",i)
         hull = hulls[i]  # (M*2)
@@ -955,7 +956,7 @@ def calculate_joint_angle_loss(thetas, hulls):
 
         is_outside = (tmp != (hull.shape[0] - 1))
         if not torch.sum(is_outside):
-            sub_loss = torch.Tensor([0]).cuda()
+            sub_loss = thetas.new_zeros(1)
         else:
             outside_theta = theta[is_outside]
             outside_theta = outside_theta.unsqueeze(1).repeat(1, hull[:-1].shape[0], 1)
@@ -968,7 +969,7 @@ def calculate_joint_angle_loss(thetas, hulls):
 
         vis = 0
         if vis:
-            print(theta)
+            logger.debug(f"joint angle theta={theta}")
             plot_hull(theta, hull)
 
         loss += sub_loss
@@ -1060,8 +1061,10 @@ def interval_loss(value, min, max):
     min = min.repeat(value.shape[0], 1)
     max = max.repeat(value.shape[0], 1)
 
-    loss1 = torch.max(min - value, torch.Tensor([0]).cuda())
-    loss2 = torch.max(value - max, torch.Tensor([0]).cuda())
+    min = min.to(device=value.device, dtype=value.dtype)
+    max = max.to(device=value.device, dtype=value.dtype)
+    loss1 = torch.max(min - value, value.new_zeros(1))
+    loss2 = torch.max(value - max, value.new_zeros(1))
 
     loss = (loss1 + loss2).sum()
 
@@ -1093,14 +1096,14 @@ class BMCLoss:
                                          allow_pickle=True)
         LEN_joint_angle_limit = len(self.joint_angle_limit)
 
-        self.bl_max = torch.from_numpy(self.bone_len_max).float().cuda()
-        self.bl_min = torch.from_numpy(self.bone_len_min).float().cuda()
-        self.rb_curvatures_max = torch.from_numpy(self.rb_curvatures_max).float().cuda()
-        self.rb_curvatures_min = torch.from_numpy(self.rb_curvatures_min).float().cuda()
-        self.rb_PHI_max = torch.from_numpy(self.rb_PHI_max).float().cuda()
-        self.rb_PHI_min = torch.from_numpy(self.rb_PHI_min).float().cuda()
+        self.bl_max = torch.from_numpy(self.bone_len_max).float()
+        self.bl_min = torch.from_numpy(self.bone_len_min).float()
+        self.rb_curvatures_max = torch.from_numpy(self.rb_curvatures_max).float()
+        self.rb_curvatures_min = torch.from_numpy(self.rb_curvatures_min).float()
+        self.rb_PHI_max = torch.from_numpy(self.rb_PHI_max).float()
+        self.rb_PHI_min = torch.from_numpy(self.rb_PHI_min).float()
 
-        self.joint_angle_limit = [torch.from_numpy(self.joint_angle_limit[i]).float().cuda() for i in
+        self.joint_angle_limit = [torch.from_numpy(self.joint_angle_limit[i]).float() for i in
                                   range(LEN_joint_angle_limit)]
 
         self.SNAP_PARENT = [
@@ -1137,6 +1140,22 @@ class BMCLoss:
         self.ID_DIP_bone = np.array([2, 6, 10, 14, 18])  # DIP_bone from  PIP to DIP
         self.ID_TIP_bone = np.array([3, 7, 11, 15, 19])  # TIP_bone from DIP to TIP
 
+    def to(self, device, dtype=None):
+        device = torch.device(device)
+        dtype = dtype or self.bl_max.dtype
+        self.bl_max = self.bl_max.to(device=device, dtype=dtype)
+        self.bl_min = self.bl_min.to(device=device, dtype=dtype)
+        self.rb_curvatures_max = self.rb_curvatures_max.to(device=device, dtype=dtype)
+        self.rb_curvatures_min = self.rb_curvatures_min.to(device=device, dtype=dtype)
+        self.rb_PHI_max = self.rb_PHI_max.to(device=device, dtype=dtype)
+        self.rb_PHI_min = self.rb_PHI_min.to(device=device, dtype=dtype)
+        self.joint_angle_limit = [hull.to(device=device, dtype=dtype) for hull in self.joint_angle_limit]
+        return self
+
+    def _ensure_device(self, reference_tensor):
+        if self.bl_max.device != reference_tensor.device or self.bl_max.dtype != reference_tensor.dtype:
+            self.to(reference_tensor.device, reference_tensor.dtype)
+
     def compute_loss(self, joints):
         '''
 
@@ -1146,10 +1165,11 @@ class BMCLoss:
         Returns:
 
         '''
+        self._ensure_device(joints)
         batch_size = joints.shape[0]
-        final_loss = torch.Tensor([0]).cuda()
+        final_loss = joints.new_zeros(1)
 
-        BMC_losses = {"bmc_bl": torch.Tensor([0]).cuda(), "bmc_rb": torch.Tensor([0]).cuda(), "bmc_a": torch.Tensor([0]).cuda()}
+        BMC_losses = {"bmc_bl": joints.new_zeros(1), "bmc_rb": joints.new_zeros(1), "bmc_a": joints.new_zeros(1)}
 
         if (self.lambda_bl < 1e-6) and (self.lambda_rb < 1e-6) and (self.lambda_a < 1e-6):
             return final_loss, BMC_losses
@@ -1174,7 +1194,7 @@ class BMCLoss:
         normals = normalize(cross_product(ROOT_bones[:, 1:], ROOT_bones[:, :-1]))
 
         # compute loss of bone length
-        bl_loss = torch.Tensor([0]).cuda()
+        bl_loss = joints.new_zeros(1)
         if self.lambda_bl:
             bls = two_norm(ALL_bones)  # (B,20,1)
             bl_loss = interval_loss(value=bls, min=self.bl_min, max=self.bl_max)
@@ -1182,9 +1202,9 @@ class BMCLoss:
         BMC_losses["bmc_bl"] = bl_loss
 
         # compute loss of Root bones
-        rb_loss = torch.Tensor([0]).cuda()
+        rb_loss = joints.new_zeros(1)
         if self.lambda_rb:
-            edge_normals = torch.zeros_like(ROOT_bones).cuda()  # (B,5,3)
+            edge_normals = torch.zeros_like(ROOT_bones)  # (B,5,3)
             edge_normals[:, [0, 4]] = normals[:, [0, 3]]
             edge_normals[:, 1:4] = normalize(normals[:, 1:4] + normals[:, :3])
 
@@ -1199,10 +1219,10 @@ class BMCLoss:
         BMC_losses["bmc_rb"] = rb_loss
 
         # compute loss of Joint angles
-        a_loss = torch.Tensor([0]).cuda()
+        a_loss = joints.new_zeros(1)
         if self.lambda_a:
             # PIP bones
-            PIP_X_axis = torch.zeros([batch_size, 5, 3]).cuda()  # (B,5,3)
+            PIP_X_axis = joints.new_zeros([batch_size, 5, 3])  # (B,5,3)
             PIP_X_axis[:, [0, 1, 4], :] = -normals[:, [0, 1, 3]]
             PIP_X_axis[:, 2:4] = -normalize(normals[:, 2:4] + normals[:, 1:3])  # (B,2,3)
             PIP_Y_axis = normalize(cross_product(PIP_Z_axis, PIP_X_axis))  # (B,5,3)

@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as torch_f
+from loguru import logger
 
 SNAP_PARENT = [
     0,  # 0's parent
@@ -96,7 +97,7 @@ def calculate_joint_angle_loss(thetas, hulls):
 
     '''
 
-    loss = torch.Tensor([0]).cuda()
+    loss = thetas.new_zeros(1)
     for i in range(15):
         # print("i=",i)
         hull = hulls[i]  # (M*2)
@@ -111,7 +112,7 @@ def calculate_joint_angle_loss(thetas, hulls):
 
         is_outside = (tmp != (hull.shape[0] - 1))
         if not torch.sum(is_outside):
-            sub_loss = torch.Tensor([0]).cuda()
+            sub_loss = thetas.new_zeros(1)
         else:
             outside_theta = theta[is_outside]
             outside_theta = outside_theta.unsqueeze(1).repeat(1, hull[:-1].shape[0], 1)
@@ -124,7 +125,7 @@ def calculate_joint_angle_loss(thetas, hulls):
 
         vis = 0
         if vis:
-            print(theta)
+            logger.debug(f"joint angle theta={theta}")
             plot_hull(theta, hull)
 
         loss += sub_loss
@@ -216,8 +217,10 @@ def interval_loss(value, min, max):
     min = min.repeat(value.shape[0], 1)
     max = max.repeat(value.shape[0], 1)
 
-    loss1 = torch.max(min - value, torch.Tensor([0]).cuda())
-    loss2 = torch.max(value - max, torch.Tensor([0]).cuda())
+    min = min.to(device=value.device, dtype=value.dtype)
+    max = max.to(device=value.device, dtype=value.dtype)
+    loss1 = torch.max(min - value, value.new_zeros(1))
+    loss2 = torch.max(value - max, value.new_zeros(1))
 
     loss = (loss1 + loss2).sum()
 
@@ -257,15 +260,31 @@ class BMCLoss:
                                          allow_pickle=True)
         LEN_joint_angle_limit = len(self.joint_angle_limit)
 
-        self.bl_max = torch.from_numpy(self.bone_len_max).float().cuda()
-        self.bl_min = torch.from_numpy(self.bone_len_min).float().cuda()
-        self.rb_curvatures_max = torch.from_numpy(self.rb_curvatures_max).float().cuda()
-        self.rb_curvatures_min = torch.from_numpy(self.rb_curvatures_min).float().cuda()
-        self.rb_PHI_max = torch.from_numpy(self.rb_PHI_max).float().cuda()
-        self.rb_PHI_min = torch.from_numpy(self.rb_PHI_min).float().cuda()
+        self.bl_max = torch.from_numpy(self.bone_len_max).float()
+        self.bl_min = torch.from_numpy(self.bone_len_min).float()
+        self.rb_curvatures_max = torch.from_numpy(self.rb_curvatures_max).float()
+        self.rb_curvatures_min = torch.from_numpy(self.rb_curvatures_min).float()
+        self.rb_PHI_max = torch.from_numpy(self.rb_PHI_max).float()
+        self.rb_PHI_min = torch.from_numpy(self.rb_PHI_min).float()
 
-        self.joint_angle_limit = [torch.from_numpy(self.joint_angle_limit[i]).float().cuda() for i in
+        self.joint_angle_limit = [torch.from_numpy(self.joint_angle_limit[i]).float() for i in
                                   range(LEN_joint_angle_limit)]
+
+    def to(self, device, dtype=None):
+        device = torch.device(device)
+        dtype = dtype or self.bl_max.dtype
+        self.bl_max = self.bl_max.to(device=device, dtype=dtype)
+        self.bl_min = self.bl_min.to(device=device, dtype=dtype)
+        self.rb_curvatures_max = self.rb_curvatures_max.to(device=device, dtype=dtype)
+        self.rb_curvatures_min = self.rb_curvatures_min.to(device=device, dtype=dtype)
+        self.rb_PHI_max = self.rb_PHI_max.to(device=device, dtype=dtype)
+        self.rb_PHI_min = self.rb_PHI_min.to(device=device, dtype=dtype)
+        self.joint_angle_limit = [hull.to(device=device, dtype=dtype) for hull in self.joint_angle_limit]
+        return self
+
+    def _ensure_device(self, reference_tensor):
+        if self.bl_max.device != reference_tensor.device or self.bl_max.dtype != reference_tensor.dtype:
+            self.to(reference_tensor.device, reference_tensor.dtype)
 
     def compute_loss(self, ori_joints, valid_mask):
         '''
@@ -278,11 +297,11 @@ class BMCLoss:
         '''
         
         joints = ori_joints[valid_mask]
-        print(joints.shape, ori_joints.shape)
+        self._ensure_device(joints)
         batch_size = joints.shape[0]
-        final_loss = torch.Tensor([0]).cuda()
+        final_loss = joints.new_zeros(1)
 
-        BMC_losses = {"bmc_bl": torch.Tensor([0]).cuda(), "bmc_rb": torch.Tensor([0]).cuda(), "bmc_a": torch.Tensor([0]).cuda()}
+        BMC_losses = {"bmc_bl": joints.new_zeros(1), "bmc_rb": joints.new_zeros(1), "bmc_a": joints.new_zeros(1)}
 
         if (self.lambda_bl < 1e-6) and (self.lambda_rb < 1e-6) and (self.lambda_a < 1e-6):
             return final_loss, BMC_losses
@@ -307,7 +326,7 @@ class BMCLoss:
         normals = normalize(cross_product(ROOT_bones[:, 1:], ROOT_bones[:, :-1]))
 
         # compute loss of bone length
-        bl_loss = torch.Tensor([0]).cuda()
+        bl_loss = joints.new_zeros(1)
         if self.lambda_bl:
             bls = two_norm(ALL_bones)  # (B,20,1)
             bl_loss = interval_loss(value=bls, min=self.bl_min, max=self.bl_max)
@@ -315,9 +334,9 @@ class BMCLoss:
         BMC_losses["bmc_bl"] = bl_loss
 
         # compute loss of Root bones
-        rb_loss = torch.Tensor([0]).cuda()
+        rb_loss = joints.new_zeros(1)
         if self.lambda_rb:
-            edge_normals = torch.zeros_like(ROOT_bones).cuda()  # (B,5,3)
+            edge_normals = torch.zeros_like(ROOT_bones)  # (B,5,3)
             edge_normals[:, [0, 4]] = normals[:, [0, 3]]
             edge_normals[:, 1:4] = normalize(normals[:, 1:4] + normals[:, :3])
 
@@ -332,10 +351,10 @@ class BMCLoss:
         BMC_losses["bmc_rb"] = rb_loss
 
         # compute loss of Joint angles
-        a_loss = torch.Tensor([0]).cuda()
+        a_loss = joints.new_zeros(1)
         if self.lambda_a:
             # PIP bones
-            PIP_X_axis = torch.zeros([batch_size, 5, 3]).cuda()  # (B,5,3)
+            PIP_X_axis = joints.new_zeros([batch_size, 5, 3])  # (B,5,3)
             PIP_X_axis[:, [0, 1, 4], :] = -normals[:, [0, 1, 3]]
             PIP_X_axis[:, 2:4] = -normalize(normals[:, 2:4] + normals[:, 1:3])  # (B,2,3)
             PIP_Y_axis = normalize(cross_product(PIP_Z_axis, PIP_X_axis))  # (B,5,3)
