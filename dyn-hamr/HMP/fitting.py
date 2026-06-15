@@ -96,6 +96,8 @@ def _process_pool(max_workers):
 def _as_plain_config(value):
     if isinstance(value, dict):
         return {k: _as_plain_config(v) for k, v in value.items()}
+    if isinstance(value, Namespace):
+        return {k: _as_plain_config(v) for k, v in vars(value).items()}
     if isinstance(value, (list, tuple)):
         return [_as_plain_config(v) for v in value]
     try:
@@ -1021,7 +1023,8 @@ def _window_worker(job):
     device = _init_hmp_model(job['device'])
     from body_model import MANO
 
-    mano_cfg = {str(k).lower(): v for k, v in job['mano_cfg'].items()}
+    mano_cfg_plain = _as_plain_config(job['mano_cfg'])
+    mano_cfg = {str(k).lower(): v for k, v in mano_cfg_plain.items()}
     hand_model = MANO(batch_size=job['mano_batch_size'], pose2rot=True, **mano_cfg).to(device)
     return _optimize_window_current_process(
         hand_model,
@@ -1268,7 +1271,8 @@ def _hand_worker(job):
         device = _init_hmp_model(job['device'])
     from body_model import MANO
 
-    mano_cfg = {str(k).lower(): v for k, v in job['mano_cfg'].items()}
+    mano_cfg_plain = _as_plain_config(job['mano_cfg'])
+    mano_cfg = {str(k).lower(): v for k, v in mano_cfg_plain.items()}
     hand_model = MANO(batch_size=job['mano_batch_size'], pose2rot=True, **mano_cfg).to(device)
     stitched, metadata = _optimize_hand_current_process(
         opt,
