@@ -742,7 +742,7 @@ def motion_reconstruction(hand_model, target, output_dir, steps, T=None, idx=0):
 
             ####################
             body_pose = matrix_to_axis_angle(local_rotmat)[:, :, 1:] # matrix_to_axis_angle(local_rotmat)
-            is_right = target['is_right'].clone()
+            is_right = target['is_right'].clone().to(model.device)
             ####################
 
             R = matrix_to_axis_angle(rotation_6d_to_matrix(opt_root_orient))
@@ -896,9 +896,9 @@ def _build_window_target(data):
         'betas': data['betas'].to(model.device),
         'save_path': data['save_path'],
         'config_type': data['config_type'],
-        'handedness': data['is_right'],
-        'vis_mask': data['vis_mask'],
-        'is_right': data['is_right'],
+        'handedness': data['is_right'].to(model.device),
+        'vis_mask': data['vis_mask'].to(model.device),
+        'is_right': data['is_right'].to(model.device),
     }
 
 
@@ -1477,13 +1477,13 @@ def latent_optimization(hand_model, target, T=None, z_l=None, z_g=None, pose=Non
     cam_t = target['cam_t'].clone()
     cam_f = target['cam_f'].clone()
     cam_center = target['cam_center'].clone()
-    is_right = target['is_right'].clone()
+    is_right = target['is_right'].clone().to(model.device)
   
     optim_trans = target['trans'].clone()
     optim_root_orient = target["root_orient"].clone()
     
     # mp_bbox_conf = target["mediapipe_bbox_conf"]
-    vis_mask = target["vis_mask"].clone().detach()
+    vis_mask = target["vis_mask"].clone().detach().to(model.device)
 
     B, seqlen, _ = optim_trans.shape
     optim_trans.requires_grad = True 
