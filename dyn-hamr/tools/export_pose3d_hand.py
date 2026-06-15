@@ -229,8 +229,7 @@ def build_hand_slot(
         mano_output_convention=mano_output_convention,
     )
     betas_arr = _betas_per_frame(betas, T)
-    pred_valid_arr = np.asarray(pred_valid, dtype=bool)
-    pred_valid_arr = pred_valid_arr & mano_params_not_all_zero(
+    pred_valid_arr = mano_params_not_all_zero(
         global_orient,
         hand_pose,
         betas_arr,

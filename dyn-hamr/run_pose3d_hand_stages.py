@@ -7,6 +7,7 @@ import json
 import shutil
 import sys
 import time
+import importlib
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,37 @@ from util.tensor import move_to
 
 STAGE_ORDER = ("root", "smooth", "prior")
 STAGE_DIR = {"root": "root_fit", "smooth": "smooth_fit", "prior": "prior"}
+
+
+def _is_numpy_core_pickle_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}"
+    return "numpy._core" in text or "No module named 'numpy._core" in text
+
+
+def _install_numpy_core_pickle_aliases() -> None:
+    """Allow numpy 1.x to load simple numpy 2.x pickle payloads."""
+    import numpy.core as numpy_core
+
+    sys.modules.setdefault("numpy._core", numpy_core)
+    for name in ("multiarray", "numeric", "fromnumeric", "umath", "_multiarray_umath"):
+        try:
+            module = importlib.import_module(f"numpy.core.{name}")
+        except Exception:
+            continue
+        sys.modules.setdefault(f"numpy._core.{name}", module)
+
+
+def _load_with_numpy_core_alias_retry(load_fn: Any) -> Any:
+    try:
+        return load_fn()
+    except (ModuleNotFoundError, ImportError) as exc:
+        if not _is_numpy_core_pickle_error(exc):
+            raise
+        logger.warning(
+            "Detected numpy._core pickle compatibility issue; installing numpy.core aliases and retrying load"
+        )
+        _install_numpy_core_pickle_aliases()
+        return load_fn()
 
 
 def configure_stage_logging(log_path: Path | None = None, level: str = "INFO") -> None:
@@ -460,7 +492,7 @@ def _coerce_track_info_on_save(track_info: dict[int, list[dict[str, Any]]]) -> d
 
 
 def load_track_info_npy(path: Path) -> dict[int, list[dict[str, Any]]]:
-    raw = np.load(path, allow_pickle=True).item()
+    raw = _load_with_numpy_core_alias_retry(lambda: np.load(path, allow_pickle=True).item())
     return _normalize_track_info_on_load(raw)
 
 
@@ -685,7 +717,9 @@ def _coerce_pose3d_on_save(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def load_pose3d_payload(pose_path: Path) -> dict[str, Any]:
-    payload = torch.load(pose_path, map_location="cpu", weights_only=False)
+    payload = _load_with_numpy_core_alias_retry(
+        lambda: torch.load(pose_path, map_location="cpu", weights_only=False)
+    )
     if not isinstance(payload, dict):
         raise TypeError(f"Expected dict payload in {pose_path}, got {type(payload)}")
     return _normalize_pose3d_on_load(payload)
@@ -999,8 +1033,7 @@ def hand_slot_from_arrays(
     betas = np.asarray(betas, dtype=np.float32)
     if betas.ndim == 1:
         betas = np.tile(betas[None], (len(global_orient), 1))
-    pred_valid = np.asarray(pred_valid, dtype=bool).reshape(len(global_orient))
-    pred_valid = pred_valid & mano_params_not_all_zero(global_orient, hand_pose, betas, transl)
+    pred_valid = mano_params_not_all_zero(global_orient, hand_pose, betas, transl)
     return {
         "mano_params": {
             "global_orient": global_orient,
