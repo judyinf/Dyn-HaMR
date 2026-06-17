@@ -1033,7 +1033,7 @@ def hand_slot_from_arrays(
     betas = np.asarray(betas, dtype=np.float32)
     if betas.ndim == 1:
         betas = np.tile(betas[None], (len(global_orient), 1))
-    pred_valid = mano_params_not_all_zero(global_orient, hand_pose, betas, transl)
+    pred_valid = np.asarray(pred_valid, dtype=bool).reshape(len(global_orient))
     return {
         "mano_params": {
             "global_orient": global_orient,
