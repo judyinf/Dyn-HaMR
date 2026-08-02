@@ -72,9 +72,13 @@ class Params(nn.Module):
         )
 
 
-class CameraParams(Params):
+class SceneParams(Params):
     """
-    Parameter container with cameras
+    Unified parameter container for the scene: MANO body parameters (trans, root_orient,
+    betas, latent_pose) and camera parameters (cam_R, cam_t, cam_f, cam_center,
+    world_scale, delta_cam_R). Inherits Params for generic nn.Parameter storage
+    and gradient control; adds camera-specific logic (world_scale scaling, w2c/c2w
+    conversion, batch broadcasting).
     """
 
     def set_cameras(

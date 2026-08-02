@@ -14,7 +14,7 @@ from util.logger import Logger
 from util.tensor import move_to, detach_all
 
 # from .helpers import estimate_initial_trans
-from .params import CameraParams
+from .params import SceneParams
 import mano
 
 J_HAND = len(MANO_JOINTS) - 1  # no root
@@ -67,7 +67,7 @@ class BaseSceneModel(nn.Module):
         print("OPT SCALE", self.opt_scale)
         print("OPT CAMERAS", self.opt_cams)
         print("Batch size: ", batch_size)
-        self.params = CameraParams(batch_size)
+        self.params = SceneParams(batch_size)
 
     def initialize(self, obs_data, cam_data):
         Logger.log("Initializing scene model with observed data")
